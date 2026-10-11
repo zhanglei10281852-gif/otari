@@ -55,7 +55,12 @@ class RateLimitService:
         )
 
     async def create_rule(self, request: RateLimitRuleCreate) -> RateLimitRulePublic:
-        """Store a new rule and start enforcing it."""
+        """Store a new rule and start enforcing it.
+
+        The new row mints a generation, so a name a deleted rule held starts with
+        empty windows and an empty concurrency set: nothing the old rule counted
+        carries over, and its late settle or release cannot reach the new rule.
+        """
         self._refuse_config_rule(request.name)
         async with self._uow:
             try:
@@ -67,7 +72,7 @@ class RateLimitService:
         return public
 
     async def update_rule(self, name: str, request: RateLimitRuleUpdate) -> RateLimitRulePublic:
-        """Change a stored rule. Its counts carry over, because they are kept under its name."""
+        """Change a stored rule. The same row keeps its generation, so the requests it counted carry over."""
         self._refuse_config_rule(name)
         async with self._uow:
             row = await self._rules.get(name)
@@ -87,7 +92,11 @@ class RateLimitService:
         return public
 
     async def delete_rule(self, name: str) -> None:
-        """Remove a stored rule and stop enforcing it."""
+        """Remove a stored rule and stop enforcing it.
+
+        Its windows and leases are left to age out of the store, so a storage
+        cleanup failure can neither fail this call nor touch any later rule.
+        """
         async with self._uow:
             row = await self._rules.get(name)
             if row is None:

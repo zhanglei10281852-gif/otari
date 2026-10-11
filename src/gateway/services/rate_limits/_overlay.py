@@ -1,9 +1,10 @@
 """Stored rules added to ``config.rate_limits``, which the request path reads on every request.
 
 Loaded at startup, applied at once on the worker that served a write, and
-reloaded on a timer so sibling workers and other replicas converge. A stored
-rule whose name a config-file rule uses is skipped: config.yml is the whole
-truth about the rules it declares.
+reloaded on a timer so sibling workers and other replicas converge. Each
+stored rule brings its generation, so the convergence also moves every replica
+off a deleted rule's counter keys. A stored rule whose name a config-file rule
+uses is skipped: config.yml is the whole truth about the rules it declares.
 """
 
 import asyncio
@@ -26,8 +27,13 @@ def config_file_rules(config: GatewayConfig) -> list[RateLimitRule]:
 
 
 def rule_of(row: StoredRateLimitRule) -> RateLimitRule:
-    """The ``RateLimitRule`` a stored row stands for."""
-    return RateLimitRule(
+    """The ``RateLimitRule`` a stored row stands for.
+
+    Carries the row's generation, so the rule's windows and leases are keyed to
+    this row instance rather than to its reusable name. A row without one (a row
+    written before generations existed) carries ``None`` and keeps the legacy keys.
+    """
+    rule = RateLimitRule(
         name=row.name,
         per=row.per,  # type: ignore[arg-type]  # the check constraint holds it to the Literal
         models=row.models,
@@ -37,6 +43,8 @@ def rule_of(row: StoredRateLimitRule) -> RateLimitRule:
         max_concurrent=row.max_concurrent,
         lease_sec=row.lease_sec,
     )
+    rule._generation = row.generation
+    return rule
 
 
 def apply_stored_rules(config: GatewayConfig, stored: Sequence[RateLimitRule]) -> list[str]:

@@ -306,6 +306,21 @@ def _refused(detail: str, retry_after: float | None, rule: str) -> HTTPException
     return HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail, headers=headers)
 
 
+def _rule_base(rule: "RateLimitRule", subject: str) -> str:
+    """The store-key prefix for ``rule`` and ``subject``.
+
+    A stored rule's generation puts its windows and leases under the row
+    instance that admitted them, not under the name an admin can reuse: a rule
+    deleted and recreated under that name counts on fresh keys, and the old
+    generation's late settle or release can only name old keys. Rules without a
+    generation (config-file rules, the synthetic budget rule, rows that predate
+    generations) keep the original name-only keys.
+    """
+    if rule.generation is None:
+        return f"rule:{rule.name}:{subject}"
+    return f"rule:{rule.name}:{rule.generation}:{subject}"
+
+
 async def _count_rule(
     store: RateLimitStorePort,
     rule: "RateLimitRule",
@@ -323,7 +338,7 @@ async def _count_rule(
         HTTPException: 429 when the request does not fit; what it took so far stays in ``hold``.
 
     """
-    base = f"rule:{rule.name}:{subject}"
+    base = _rule_base(rule, subject)
     if rule.rpm is not None:
         window = await store.hit(f"{base}:rpm", rule.rpm, _RULE_WINDOW_SEC)
         if window.handle is None:

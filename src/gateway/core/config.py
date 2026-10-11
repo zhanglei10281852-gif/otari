@@ -373,6 +373,14 @@ class RateLimitRule(BaseModel):
             "ends; this bounds what a process that dies mid-request keeps."
         ),
     )
+    # The stored-rule instance this object stands for, set only by the stored-rules overlay.
+    # A config-file rule and the synthetic budget rule carry none. Not part of the YAML/API schema.
+    _generation: str | None = PrivateAttr(default=None)
+
+    @property
+    def generation(self) -> str | None:
+        """The stored rule instance this object's counts are bound to; ``None`` keeps the name-only keys."""
+        return self._generation
 
     @model_validator(mode="after")
     def _requires_a_limit(self) -> "RateLimitRule":

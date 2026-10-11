@@ -288,6 +288,41 @@ async def test_what_the_fallback_issued_goes_back_to_it_after_redis_recovers() -
 
 
 @pytest.mark.asyncio
+async def test_an_outage_generation_settles_locally_and_never_touches_the_recovered_generation() -> None:
+    """A handle and lease issued during an outage are routed by their full generation key after recovery."""
+    client = _RecoveringRedis()
+    store = RedisRateLimitStore(client)  # type: ignore[arg-type]
+    old_concurrent = "rule:cap:11111111111111111111111111111111:all:concurrent"
+    new_concurrent = "rule:cap:22222222222222222222222222222222:all:concurrent"
+    old_tpm = "rule:cap:11111111111111111111111111111111:all:tpm"
+    new_tpm = "rule:cap:22222222222222222222222222222222:all:tpm"
+
+    # The old generation's request takes its slot and estimate while Redis is down.
+    old_lease = await store.acquire(old_concurrent, 1, 30)
+    old_estimate = await store.hit(old_tpm, 100, 60, cost=90)
+    assert old_lease is not None
+    assert old_estimate.handle is not None
+
+    client.up = True
+    store._retry_at = None
+    # The recreated rule's generation counts in Redis once it answers again.
+    new_lease = await store.acquire(new_concurrent, 1, 30)
+    assert new_lease is not None
+    assert (await store.hit(new_tpm, 100, 60, cost=60)).allowed
+
+    # The old request settles and releases after recovery: both stay in the fallback, by their key.
+    await store.release(old_concurrent, old_lease)
+    await store.settle(old_tpm, old_estimate.handle, 30)
+    assert client.zrems == []
+    assert await store._fallback.acquire(old_concurrent, 1, 30) is not None
+    assert (await store._fallback.hit(old_tpm, 100, 60, cost=70)).allowed
+
+    # The new generation's Redis lease is released only when its own request ends.
+    await store.release(new_concurrent, new_lease)
+    assert client.zrems == [new_lease]
+
+
+@pytest.mark.asyncio
 async def test_keys_whose_leases_all_ran_out_are_dropped() -> None:
     store = InMemoryRateLimitStore()
 

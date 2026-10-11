@@ -114,6 +114,42 @@ def test_a_deleted_rule_stops_applying(client: TestClient) -> None:
     assert [rule["name"] for rule in client.get(_RULES, headers=_MASTER).json()["rules"]] == ["from-file"]
 
 
+def _stored_generations(client: TestClient) -> dict[str, str | None]:
+    return {rule.name: rule.generation for rule in client.app.state.config.rate_limits}
+
+
+def test_a_recreated_rule_starts_with_an_empty_window(client: TestClient) -> None:
+    """Deleting an exhausted rule and storing one under the same name restarts its window."""
+    headers = _key(client, "reset-me")
+    client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 1}, headers=_MASTER)
+    assert _chats(client, headers, 2) == [200, 429]
+
+    assert client.delete(f"{_RULES}/keys", headers=_MASTER).status_code == 204
+    recreated = client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 1}, headers=_MASTER)
+    assert recreated.status_code == 201
+
+    assert _chats(client, headers, 2) == [200, 429]
+
+
+def test_an_edit_keeps_the_generation_a_recreate_changes_it(client: TestClient) -> None:
+    created = client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 1}, headers=_MASTER)
+    assert created.status_code == 201
+    assert "generation" not in created.json()
+    first_generation = _stored_generations(client)["keys"]
+    assert isinstance(first_generation, str) and len(first_generation) == 32
+
+    assert client.patch(f"{_RULES}/keys", json={"rpm": 2}, headers=_MASTER).status_code == 200
+    assert _stored_generations(client)["keys"] == first_generation
+
+    assert client.delete(f"{_RULES}/keys", headers=_MASTER).status_code == 204
+    assert client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 2}, headers=_MASTER).status_code == 201
+    second_generation = _stored_generations(client)["keys"]
+    assert isinstance(second_generation, str)
+    assert second_generation != first_generation
+    # The config-file rule never takes a generation.
+    assert _stored_generations(client)["from-file"] is None
+
+
 def test_a_config_rule_is_read_only(client: TestClient) -> None:
     created = client.post(_RULES, json={"name": "from-file", "per": "key", "rpm": 1}, headers=_MASTER)
     changed = client.patch(f"{_RULES}/from-file", json={"rpm": 1}, headers=_MASTER)

@@ -219,7 +219,11 @@ the name its pricing uses.
 Rules can also be added, changed and removed from the dashboard (Settings, Rate
 limit rules) or through `/api/v1/rate-limits`. A change applies at once on the
 replica that served it and on every other replica within 30 seconds; a changed
-rule keeps the requests it already counted. Choose "Each model" to add a
+rule keeps the requests it already counted. Removing a rule and adding one under
+the same name starts the new rule with an empty window and no held slots: every
+stored rule is a distinct instance, and a request still in flight under the
+removed rule gives its slot back to that instance only. The old instance's
+counters expire out of the store on their own. Choose "Each model" to add a
 `per: model` rule and pick its models. The rules in config.yml are listed there read-only, and a stored rule cannot take the name of one. A stored rule
 whose name config.yml later declares is skipped with a warning at startup and
 left out of the list; `DELETE /api/v1/rate-limits/{name}` still removes it. A

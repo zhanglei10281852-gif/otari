@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 动态规则删除后以同名重新创建会获得新的持久代际，RPM、TPM 和并发容量均从空状态开始。
+  - id: 2
+    type: f2p
+    text: PATCH 修改现存规则不会更换代际，原有窗口计数与在途并发 lease 继续约束修改后的同一规则。
+  - id: 3
+    type: f2p
+    text: 旧代请求迟到的 token settle 或并发 release 只作用于旧代，不能增加、扣减或清除新代规则的状态。
+  - id: 4
+    type: f2p
+    text: 多副本通过 overlay 观察删除重建后使用同一新代；重启继续现存代际，升级前规则也获得稳定且可重复的兼容代际。
+  - id: 5
+    type: f2p
+    text: Redis 正常、内存 store 以及 Redis 故障期间签发并在恢复后结算的 handle 都按签发代际访问状态，不发生跨代污染。
+  - id: 6
+    type: f2p
+    text: 旧代存储清理失败不回滚成功的规则 CRUD，也不会删除同名新代；旧状态可在过期后安全回收。
+  - id: 7
+    type: p2p
+    text: 配置文件规则仍只读，未删除重建的规则保持现有 subject 和 model 隔离、429 详情、Retry-After 及默认限流行为。

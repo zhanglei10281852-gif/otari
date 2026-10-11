@@ -18,12 +18,23 @@ from gateway.rate_limit import (
     BudgetMinuteLimits,
     RateLimitGrantMiddleware,
     RateLimitRules,
+    _rule_base,
     admit_rate_limit_rules,
 )
+
+_OLD_GENERATION = "1" * 32
+_NEW_GENERATION = "2" * 32
 
 
 def _request() -> Request:
     return Request({"type": "http", "headers": []})
+
+
+def _generation_rule(generation: str | None, **rule: Any) -> RateLimitRule:
+    """A rule as the overlay loads one, bound to a stored row's generation."""
+    built = RateLimitRule(**rule)
+    built._generation = generation
+    return built
 
 
 def _rules(store: InMemoryRateLimitStore, *rules: dict[str, Any]) -> RateLimitRules:
@@ -574,6 +585,102 @@ async def test_admission_counts_a_budgets_minute_limits_when_no_rule_is_configur
         await admit_rate_limit_rules(request, key_id="k", user_id="u", estimated_tokens=10, budget_limits=limits)
 
     assert exc_info.value.status_code == 429
+
+
+def test_a_rule_without_a_generation_keeps_the_name_only_keys() -> None:
+    rule = RateLimitRule(name="cap", per="key", rpm=1)
+
+    assert rule.generation is None
+    assert _rule_base(rule, "k1") == "rule:cap:k1"
+
+
+def test_a_generation_scopes_a_rules_keys() -> None:
+    rule = _generation_rule("a" * 32, name="cap", per="key", rpm=1)
+
+    assert _rule_base(rule, "k1") == f"rule:cap:{'a' * 32}:k1"
+
+
+@pytest.mark.asyncio
+async def test_a_recreated_rule_starts_with_an_empty_window() -> None:
+    """A same-name rule with a new generation does not inherit the old rule's exhausted RPM window."""
+    store = InMemoryRateLimitStore()
+    config = GatewayConfig(rate_limits=[_generation_rule(_OLD_GENERATION, name="cap", per="deployment", rpm=1)])
+    rules = RateLimitRules(store, config)
+
+    await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+    with pytest.raises(HTTPException, match="'cap'"):
+        await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+
+    config.rate_limits = [_generation_rule(_NEW_GENERATION, name="cap", per="deployment", rpm=1)]
+
+    await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+
+    # The generations are separate windows: each still holds exactly its own one request.
+    old_window = await store.hit(f"rule:cap:{_OLD_GENERATION}:all:rpm", 1, 60)
+    new_window = await store.hit(f"rule:cap:{_NEW_GENERATION}:all:rpm", 1, 60)
+    assert (old_window.allowed, old_window.count) == (False, 1)
+    assert (new_window.allowed, new_window.count) == (False, 1)
+
+
+@pytest.mark.asyncio
+async def test_an_old_generations_late_settle_and_release_cannot_touch_the_new_one() -> None:
+    """A request admitted under a deleted rule settles and releases after its replacement exists."""
+    store = InMemoryRateLimitStore()
+    rule_args = {
+        "name": "cap",
+        "per": "deployment",
+        "tpm": 1000,
+        "tpm_admission": "estimate",
+        "max_concurrent": 1,
+    }
+    config = GatewayConfig(rate_limits=[_generation_rule(_OLD_GENERATION, **rule_args)])
+    rules = RateLimitRules(store, config)
+    old = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=600)
+
+    config.rate_limits = [_generation_rule(_NEW_GENERATION, **rule_args)]
+    await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=600)
+
+    # The old request ends only now, after the same-name rule was recreated.
+    await old.settle(50)
+    await old.release()
+
+    old_tpm = f"rule:cap:{_OLD_GENERATION}:all:tpm"
+    new_tpm = f"rule:cap:{_NEW_GENERATION}:all:tpm"
+    old_concurrent = f"rule:cap:{_OLD_GENERATION}:all:concurrent"
+    new_concurrent = f"rule:cap:{_NEW_GENERATION}:all:concurrent"
+    # The old window was settled to 50 and the old slot came back.
+    assert (await store.hit(old_tpm, 1000, 60, cost=950)).allowed
+    assert await store.acquire(old_concurrent, 1, 900) is not None
+    # The new generation still holds its 600-token estimate and its one slot.
+    assert not (await store.hit(new_tpm, 1000, 60, cost=401)).allowed
+    assert await store.acquire(new_concurrent, 1, 900) is None
+
+    # The old release did not hand the new generation's slot back: another request is refused it.
+    with pytest.raises(HTTPException, match="1 request in flight"):
+        await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+
+
+@pytest.mark.asyncio
+async def test_a_recreated_per_model_rule_starts_empty_and_an_old_hold_cannot_free_its_slot() -> None:
+    store = InMemoryRateLimitStore()
+    rule_args = {"name": "cap", "per": "model", "models": ["openai:gpt-4o"], "max_concurrent": 1}
+    config = GatewayConfig(rate_limits=[_generation_rule(_OLD_GENERATION, **rule_args)])
+    rules = RateLimitRules(store, config)
+    old = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+    assert await old.admit_model("openai", "gpt-4o") is not None
+
+    config.rate_limits = [_generation_rule(_NEW_GENERATION, **rule_args)]
+    new = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+    assert await new.admit_model("openai", "gpt-4o") is not None
+
+    # The first generation's request finishes after the rule was recreated.
+    await old.release()
+
+    third = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
+    with pytest.raises(HTTPException, match="1 request in flight"):
+        await third.admit_model("openai", "gpt-4o")
+
+    await new.release()
 
 
 @pytest.mark.asyncio

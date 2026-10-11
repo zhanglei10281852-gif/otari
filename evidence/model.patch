@@ -1,0 +1,500 @@
+diff --git a/alembic/versions/f5b2d8c1e9a4_rate_limit_rule_generations.py b/alembic/versions/f5b2d8c1e9a4_rate_limit_rule_generations.py
+new file mode 100644
+index 00000000..59ada0bd
+--- /dev/null
++++ b/alembic/versions/f5b2d8c1e9a4_rate_limit_rule_generations.py
+@@ -0,0 +1,35 @@
++"""Bind each stored rate-limit rule's counts to its row instance with a generation.
++
++Adds the nullable ``generation`` a stored rule's RPM/TPM windows and concurrency
++leases are keyed by. A row written before this column keeps NULL, the
++compatibility generation: its counts and slots keep the keys they always used,
++deterministically and across restarts. Every rule stored afterwards mints a
++fresh generation, so a rule deleted and recreated under the same name starts
++from empty windows and an empty concurrency set, and the deleted generation's
++late settle and release cannot touch the new one.
++
++Revision ID: f5b2d8c1e9a4
++Revises: c7e1a4d9b3f2
++Create Date: 2026-10-10
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++revision: str = "f5b2d8c1e9a4"
++down_revision: str | Sequence[str] | None = "c7e1a4d9b3f2"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    """Add ``generation``; existing rows stay NULL, which keeps their original counter keys."""
++    op.add_column("rate_limit_rules", sa.Column("generation", sa.String(), nullable=True))
++
++
++def downgrade() -> None:
++    """Drop ``generation``; rules go back to counters keyed by name."""
++    with op.batch_alter_table("rate_limit_rules") as batch:
++        batch.drop_column("generation")
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 3b962ce4..4d945eac 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -219,7 +219,11 @@ the name its pricing uses.
+ Rules can also be added, changed and removed from the dashboard (Settings, Rate
+ limit rules) or through `/api/v1/rate-limits`. A change applies at once on the
+ replica that served it and on every other replica within 30 seconds; a changed
+-rule keeps the requests it already counted. Choose "Each model" to add a
++rule keeps the requests it already counted. Removing a rule and adding one under
++the same name starts the new rule with an empty window and no held slots: every
++stored rule is a distinct instance, and a request still in flight under the
++removed rule gives its slot back to that instance only. The old instance's
++counters expire out of the store on their own. Choose "Each model" to add a
+ `per: model` rule and pick its models. The rules in config.yml are listed there read-only, and a stored rule cannot take the name of one. A stored rule
+ whose name config.yml later declares is skipped with a warning at startup and
+ left out of the list; `DELETE /api/v1/rate-limits/{name}` still removes it. A
+diff --git a/src/gateway/core/config.py b/src/gateway/core/config.py
+index 251cd73f..27ba123c 100644
+--- a/src/gateway/core/config.py
++++ b/src/gateway/core/config.py
+@@ -373,6 +373,14 @@ class RateLimitRule(BaseModel):
+             "ends; this bounds what a process that dies mid-request keeps."
+         ),
+     )
++    # The stored-rule instance this object stands for, set only by the stored-rules overlay.
++    # A config-file rule and the synthetic budget rule carry none. Not part of the YAML/API schema.
++    _generation: str | None = PrivateAttr(default=None)
++
++    @property
++    def generation(self) -> str | None:
++        """The stored rule instance this object's counts are bound to; ``None`` keeps the name-only keys."""
++        return self._generation
+ 
+     @model_validator(mode="after")
+     def _requires_a_limit(self) -> "RateLimitRule":
+diff --git a/src/gateway/models/rate_limits.py b/src/gateway/models/rate_limits.py
+index 3de5b6de..566c684d 100644
+--- a/src/gateway/models/rate_limits.py
++++ b/src/gateway/models/rate_limits.py
+@@ -1,5 +1,6 @@
+ """ORM table for the rate-limit rules an operator adds through the dashboard."""
+ 
++import uuid
+ from datetime import UTC, datetime
+ 
+ from sqlalchemy import JSON, CheckConstraint, String, func
+@@ -8,6 +9,11 @@ from sqlalchemy.orm import Mapped, mapped_column
+ from gateway.models.base import Base, UtcDateTime
+ 
+ 
++def _new_generation() -> str:
++    """The generation a freshly stored rule counts under: an opaque key-safe token."""
++    return uuid.uuid4().hex
++
++
+ class StoredRateLimitRule(Base):
+     """A ``rate_limits`` rule added at runtime, counted beside the config-file rules.
+ 
+@@ -25,6 +31,11 @@ class StoredRateLimitRule(Base):
+     )
+ 
+     name: Mapped[str] = mapped_column(String, primary_key=True)
++    # Binds the rule's counts and leases to this row instance. NULL is the stable
++    # compatibility generation of a row written before generations existed: it
++    # keeps the name-only keys its counters always used. A recreated row mints a
++    # fresh value, so it can never count under a deleted rule's keys.
++    generation: Mapped[str | None] = mapped_column(String, nullable=True, default=_new_generation)
+     per: Mapped[str] = mapped_column(String)
+     # The instance:model names a per-model rule limits; null for every other rule.
+     models: Mapped[list[str] | None] = mapped_column(JSON, default=None)
+diff --git a/src/gateway/rate_limit.py b/src/gateway/rate_limit.py
+index 1c97ace8..f85502ae 100644
+--- a/src/gateway/rate_limit.py
++++ b/src/gateway/rate_limit.py
+@@ -306,6 +306,21 @@ def _refused(detail: str, retry_after: float | None, rule: str) -> HTTPException
+     return HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail, headers=headers)
+ 
+ 
++def _rule_base(rule: "RateLimitRule", subject: str) -> str:
++    """The store-key prefix for ``rule`` and ``subject``.
++
++    A stored rule's generation puts its windows and leases under the row
++    instance that admitted them, not under the name an admin can reuse: a rule
++    deleted and recreated under that name counts on fresh keys, and the old
++    generation's late settle or release can only name old keys. Rules without a
++    generation (config-file rules, the synthetic budget rule, rows that predate
++    generations) keep the original name-only keys.
++    """
++    if rule.generation is None:
++        return f"rule:{rule.name}:{subject}"
++    return f"rule:{rule.name}:{rule.generation}:{subject}"
++
++
+ async def _count_rule(
+     store: RateLimitStorePort,
+     rule: "RateLimitRule",
+@@ -323,7 +338,7 @@ async def _count_rule(
+         HTTPException: 429 when the request does not fit; what it took so far stays in ``hold``.
+ 
+     """
+-    base = f"rule:{rule.name}:{subject}"
++    base = _rule_base(rule, subject)
+     if rule.rpm is not None:
+         window = await store.hit(f"{base}:rpm", rule.rpm, _RULE_WINDOW_SEC)
+         if window.handle is None:
+diff --git a/src/gateway/services/rate_limits/_overlay.py b/src/gateway/services/rate_limits/_overlay.py
+index 8cf1a59e..a22cbe24 100644
+--- a/src/gateway/services/rate_limits/_overlay.py
++++ b/src/gateway/services/rate_limits/_overlay.py
+@@ -1,9 +1,10 @@
+ """Stored rules added to ``config.rate_limits``, which the request path reads on every request.
+ 
+ Loaded at startup, applied at once on the worker that served a write, and
+-reloaded on a timer so sibling workers and other replicas converge. A stored
+-rule whose name a config-file rule uses is skipped: config.yml is the whole
+-truth about the rules it declares.
++reloaded on a timer so sibling workers and other replicas converge. Each
++stored rule brings its generation, so the convergence also moves every replica
++off a deleted rule's counter keys. A stored rule whose name a config-file rule
++uses is skipped: config.yml is the whole truth about the rules it declares.
+ """
+ 
+ import asyncio
+@@ -26,8 +27,13 @@ def config_file_rules(config: GatewayConfig) -> list[RateLimitRule]:
+ 
+ 
+ def rule_of(row: StoredRateLimitRule) -> RateLimitRule:
+-    """The ``RateLimitRule`` a stored row stands for."""
+-    return RateLimitRule(
++    """The ``RateLimitRule`` a stored row stands for.
++
++    Carries the row's generation, so the rule's windows and leases are keyed to
++    this row instance rather than to its reusable name. A row without one (a row
++    written before generations existed) carries ``None`` and keeps the legacy keys.
++    """
++    rule = RateLimitRule(
+         name=row.name,
+         per=row.per,  # type: ignore[arg-type]  # the check constraint holds it to the Literal
+         models=row.models,
+@@ -37,6 +43,8 @@ def rule_of(row: StoredRateLimitRule) -> RateLimitRule:
+         max_concurrent=row.max_concurrent,
+         lease_sec=row.lease_sec,
+     )
++    rule._generation = row.generation
++    return rule
+ 
+ 
+ def apply_stored_rules(config: GatewayConfig, stored: Sequence[RateLimitRule]) -> list[str]:
+diff --git a/src/gateway/services/rate_limits/_service.py b/src/gateway/services/rate_limits/_service.py
+index c9107b91..bd139709 100644
+--- a/src/gateway/services/rate_limits/_service.py
++++ b/src/gateway/services/rate_limits/_service.py
+@@ -55,7 +55,12 @@ class RateLimitService:
+         )
+ 
+     async def create_rule(self, request: RateLimitRuleCreate) -> RateLimitRulePublic:
+-        """Store a new rule and start enforcing it."""
++        """Store a new rule and start enforcing it.
++
++        The new row mints a generation, so a name a deleted rule held starts with
++        empty windows and an empty concurrency set: nothing the old rule counted
++        carries over, and its late settle or release cannot reach the new rule.
++        """
+         self._refuse_config_rule(request.name)
+         async with self._uow:
+             try:
+@@ -67,7 +72,7 @@ class RateLimitService:
+         return public
+ 
+     async def update_rule(self, name: str, request: RateLimitRuleUpdate) -> RateLimitRulePublic:
+-        """Change a stored rule. Its counts carry over, because they are kept under its name."""
++        """Change a stored rule. The same row keeps its generation, so the requests it counted carry over."""
+         self._refuse_config_rule(name)
+         async with self._uow:
+             row = await self._rules.get(name)
+@@ -87,7 +92,11 @@ class RateLimitService:
+         return public
+ 
+     async def delete_rule(self, name: str) -> None:
+-        """Remove a stored rule and stop enforcing it."""
++        """Remove a stored rule and stop enforcing it.
++
++        Its windows and leases are left to age out of the store, so a storage
++        cleanup failure can neither fail this call nor touch any later rule.
++        """
+         async with self._uow:
+             row = await self._rules.get(name)
+             if row is None:
+diff --git a/tests/integration/test_rate_limit_rules_api.py b/tests/integration/test_rate_limit_rules_api.py
+index b7010569..3d89dbd2 100644
+--- a/tests/integration/test_rate_limit_rules_api.py
++++ b/tests/integration/test_rate_limit_rules_api.py
+@@ -114,6 +114,42 @@ def test_a_deleted_rule_stops_applying(client: TestClient) -> None:
+     assert [rule["name"] for rule in client.get(_RULES, headers=_MASTER).json()["rules"]] == ["from-file"]
+ 
+ 
++def _stored_generations(client: TestClient) -> dict[str, str | None]:
++    return {rule.name: rule.generation for rule in client.app.state.config.rate_limits}
++
++
++def test_a_recreated_rule_starts_with_an_empty_window(client: TestClient) -> None:
++    """Deleting an exhausted rule and storing one under the same name restarts its window."""
++    headers = _key(client, "reset-me")
++    client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 1}, headers=_MASTER)
++    assert _chats(client, headers, 2) == [200, 429]
++
++    assert client.delete(f"{_RULES}/keys", headers=_MASTER).status_code == 204
++    recreated = client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 1}, headers=_MASTER)
++    assert recreated.status_code == 201
++
++    assert _chats(client, headers, 2) == [200, 429]
++
++
++def test_an_edit_keeps_the_generation_a_recreate_changes_it(client: TestClient) -> None:
++    created = client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 1}, headers=_MASTER)
++    assert created.status_code == 201
++    assert "generation" not in created.json()
++    first_generation = _stored_generations(client)["keys"]
++    assert isinstance(first_generation, str) and len(first_generation) == 32
++
++    assert client.patch(f"{_RULES}/keys", json={"rpm": 2}, headers=_MASTER).status_code == 200
++    assert _stored_generations(client)["keys"] == first_generation
++
++    assert client.delete(f"{_RULES}/keys", headers=_MASTER).status_code == 204
++    assert client.post(_RULES, json={"name": "keys", "per": "key", "rpm": 2}, headers=_MASTER).status_code == 201
++    second_generation = _stored_generations(client)["keys"]
++    assert isinstance(second_generation, str)
++    assert second_generation != first_generation
++    # The config-file rule never takes a generation.
++    assert _stored_generations(client)["from-file"] is None
++
++
+ def test_a_config_rule_is_read_only(client: TestClient) -> None:
+     created = client.post(_RULES, json={"name": "from-file", "per": "key", "rpm": 1}, headers=_MASTER)
+     changed = client.patch(f"{_RULES}/from-file", json={"rpm": 1}, headers=_MASTER)
+diff --git a/tests/unit/test_rate_limit_overlay.py b/tests/unit/test_rate_limit_overlay.py
+index f2bdd0de..baa3999c 100644
+--- a/tests/unit/test_rate_limit_overlay.py
++++ b/tests/unit/test_rate_limit_overlay.py
+@@ -1,7 +1,8 @@
+ """Stored rate-limit rules added to ``config.rate_limits``."""
+ 
+ from gateway.core.config import GatewayConfig, RateLimitRule
+-from gateway.services.rate_limits._overlay import apply_stored_rules, config_file_rules
++from gateway.models.rate_limits import StoredRateLimitRule
++from gateway.services.rate_limits._overlay import apply_stored_rules, config_file_rules, rule_of
+ 
+ 
+ def _rule(name: str, rpm: int = 1) -> RateLimitRule:
+@@ -33,3 +34,29 @@ def test_applying_again_drops_a_rule_no_longer_stored() -> None:
+     apply_stored_rules(config, [])
+ 
+     assert [rule.name for rule in config.rate_limits] == ["file"]
++
++
++def test_rule_of_carries_the_rows_generation() -> None:
++    row = StoredRateLimitRule(
++        name="stored", per="key", rpm=1, tpm_admission="used", lease_sec=900.0, generation="a" * 32
++    )
++
++    assert rule_of(row).generation == "a" * 32
++
++
++def test_rule_of_treats_a_row_without_a_generation_as_legacy() -> None:
++    """A row written before generations existed keeps the name-only counter keys."""
++    row = StoredRateLimitRule(name="old", per="key", rpm=1, tpm_admission="used", lease_sec=900.0)
++
++    assert rule_of(row).generation is None
++
++
++def test_applying_carries_each_stored_rules_generation() -> None:
++    """The reload every replica runs must propagate the generation the request path keys on."""
++    config = GatewayConfig(rate_limits=[_rule("file")])
++    stored = _rule("stored")
++    stored._generation = "b" * 32
++
++    apply_stored_rules(config, [stored])
++
++    assert config.rate_limits[1].generation == "b" * 32
+diff --git a/tests/unit/test_rate_limit_rules.py b/tests/unit/test_rate_limit_rules.py
+index 4c033d00..2553d004 100644
+--- a/tests/unit/test_rate_limit_rules.py
++++ b/tests/unit/test_rate_limit_rules.py
+@@ -18,14 +18,25 @@ from gateway.rate_limit import (
+     BudgetMinuteLimits,
+     RateLimitGrantMiddleware,
+     RateLimitRules,
++    _rule_base,
+     admit_rate_limit_rules,
+ )
+ 
++_OLD_GENERATION = "1" * 32
++_NEW_GENERATION = "2" * 32
++
+ 
+ def _request() -> Request:
+     return Request({"type": "http", "headers": []})
+ 
+ 
++def _generation_rule(generation: str | None, **rule: Any) -> RateLimitRule:
++    """A rule as the overlay loads one, bound to a stored row's generation."""
++    built = RateLimitRule(**rule)
++    built._generation = generation
++    return built
++
++
+ def _rules(store: InMemoryRateLimitStore, *rules: dict[str, Any]) -> RateLimitRules:
+     return RateLimitRules(store, GatewayConfig(rate_limits=[RateLimitRule(**rule) for rule in rules]))
+ 
+@@ -576,6 +587,102 @@ async def test_admission_counts_a_budgets_minute_limits_when_no_rule_is_configur
+     assert exc_info.value.status_code == 429
+ 
+ 
++def test_a_rule_without_a_generation_keeps_the_name_only_keys() -> None:
++    rule = RateLimitRule(name="cap", per="key", rpm=1)
++
++    assert rule.generation is None
++    assert _rule_base(rule, "k1") == "rule:cap:k1"
++
++
++def test_a_generation_scopes_a_rules_keys() -> None:
++    rule = _generation_rule("a" * 32, name="cap", per="key", rpm=1)
++
++    assert _rule_base(rule, "k1") == f"rule:cap:{'a' * 32}:k1"
++
++
++@pytest.mark.asyncio
++async def test_a_recreated_rule_starts_with_an_empty_window() -> None:
++    """A same-name rule with a new generation does not inherit the old rule's exhausted RPM window."""
++    store = InMemoryRateLimitStore()
++    config = GatewayConfig(rate_limits=[_generation_rule(_OLD_GENERATION, name="cap", per="deployment", rpm=1)])
++    rules = RateLimitRules(store, config)
++
++    await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++    with pytest.raises(HTTPException, match="'cap'"):
++        await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++
++    config.rate_limits = [_generation_rule(_NEW_GENERATION, name="cap", per="deployment", rpm=1)]
++
++    await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++
++    # The generations are separate windows: each still holds exactly its own one request.
++    old_window = await store.hit(f"rule:cap:{_OLD_GENERATION}:all:rpm", 1, 60)
++    new_window = await store.hit(f"rule:cap:{_NEW_GENERATION}:all:rpm", 1, 60)
++    assert (old_window.allowed, old_window.count) == (False, 1)
++    assert (new_window.allowed, new_window.count) == (False, 1)
++
++
++@pytest.mark.asyncio
++async def test_an_old_generations_late_settle_and_release_cannot_touch_the_new_one() -> None:
++    """A request admitted under a deleted rule settles and releases after its replacement exists."""
++    store = InMemoryRateLimitStore()
++    rule_args = {
++        "name": "cap",
++        "per": "deployment",
++        "tpm": 1000,
++        "tpm_admission": "estimate",
++        "max_concurrent": 1,
++    }
++    config = GatewayConfig(rate_limits=[_generation_rule(_OLD_GENERATION, **rule_args)])
++    rules = RateLimitRules(store, config)
++    old = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=600)
++
++    config.rate_limits = [_generation_rule(_NEW_GENERATION, **rule_args)]
++    await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=600)
++
++    # The old request ends only now, after the same-name rule was recreated.
++    await old.settle(50)
++    await old.release()
++
++    old_tpm = f"rule:cap:{_OLD_GENERATION}:all:tpm"
++    new_tpm = f"rule:cap:{_NEW_GENERATION}:all:tpm"
++    old_concurrent = f"rule:cap:{_OLD_GENERATION}:all:concurrent"
++    new_concurrent = f"rule:cap:{_NEW_GENERATION}:all:concurrent"
++    # The old window was settled to 50 and the old slot came back.
++    assert (await store.hit(old_tpm, 1000, 60, cost=950)).allowed
++    assert await store.acquire(old_concurrent, 1, 900) is not None
++    # The new generation still holds its 600-token estimate and its one slot.
++    assert not (await store.hit(new_tpm, 1000, 60, cost=401)).allowed
++    assert await store.acquire(new_concurrent, 1, 900) is None
++
++    # The old release did not hand the new generation's slot back: another request is refused it.
++    with pytest.raises(HTTPException, match="1 request in flight"):
++        await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++
++
++@pytest.mark.asyncio
++async def test_a_recreated_per_model_rule_starts_empty_and_an_old_hold_cannot_free_its_slot() -> None:
++    store = InMemoryRateLimitStore()
++    rule_args = {"name": "cap", "per": "model", "models": ["openai:gpt-4o"], "max_concurrent": 1}
++    config = GatewayConfig(rate_limits=[_generation_rule(_OLD_GENERATION, **rule_args)])
++    rules = RateLimitRules(store, config)
++    old = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++    assert await old.admit_model("openai", "gpt-4o") is not None
++
++    config.rate_limits = [_generation_rule(_NEW_GENERATION, **rule_args)]
++    new = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++    assert await new.admit_model("openai", "gpt-4o") is not None
++
++    # The first generation's request finishes after the rule was recreated.
++    await old.release()
++
++    third = await rules.admit(_request(), key_id=None, user_id=None, estimated_tokens=1)
++    with pytest.raises(HTTPException, match="1 request in flight"):
++        await third.admit_model("openai", "gpt-4o")
++
++    await new.release()
++
++
+ @pytest.mark.asyncio
+ async def test_admission_is_skipped_on_an_app_that_holds_no_rules() -> None:
+     limits = BudgetMinuteLimits(budget_id="b", rpm=1, tpm=None)
+diff --git a/tests/unit/test_rate_limit_store.py b/tests/unit/test_rate_limit_store.py
+index c79b3b4c..a5baf6e4 100644
+--- a/tests/unit/test_rate_limit_store.py
++++ b/tests/unit/test_rate_limit_store.py
+@@ -287,6 +287,41 @@ async def test_what_the_fallback_issued_goes_back_to_it_after_redis_recovers() -
+     assert (await store._fallback.hit("k", 100, 60, cost=70)).allowed
+ 
+ 
++@pytest.mark.asyncio
++async def test_an_outage_generation_settles_locally_and_never_touches_the_recovered_generation() -> None:
++    """A handle and lease issued during an outage are routed by their full generation key after recovery."""
++    client = _RecoveringRedis()
++    store = RedisRateLimitStore(client)  # type: ignore[arg-type]
++    old_concurrent = "rule:cap:11111111111111111111111111111111:all:concurrent"
++    new_concurrent = "rule:cap:22222222222222222222222222222222:all:concurrent"
++    old_tpm = "rule:cap:11111111111111111111111111111111:all:tpm"
++    new_tpm = "rule:cap:22222222222222222222222222222222:all:tpm"
++
++    # The old generation's request takes its slot and estimate while Redis is down.
++    old_lease = await store.acquire(old_concurrent, 1, 30)
++    old_estimate = await store.hit(old_tpm, 100, 60, cost=90)
++    assert old_lease is not None
++    assert old_estimate.handle is not None
++
++    client.up = True
++    store._retry_at = None
++    # The recreated rule's generation counts in Redis once it answers again.
++    new_lease = await store.acquire(new_concurrent, 1, 30)
++    assert new_lease is not None
++    assert (await store.hit(new_tpm, 100, 60, cost=60)).allowed
++
++    # The old request settles and releases after recovery: both stay in the fallback, by their key.
++    await store.release(old_concurrent, old_lease)
++    await store.settle(old_tpm, old_estimate.handle, 30)
++    assert client.zrems == []
++    assert await store._fallback.acquire(old_concurrent, 1, 30) is not None
++    assert (await store._fallback.hit(old_tpm, 100, 60, cost=70)).allowed
++
++    # The new generation's Redis lease is released only when its own request ends.
++    await store.release(new_concurrent, new_lease)
++    assert client.zrems == [new_lease]
++
++
+ @pytest.mark.asyncio
+ async def test_keys_whose_leases_all_ran_out_are_dropped() -> None:
+     store = InMemoryRateLimitStore()

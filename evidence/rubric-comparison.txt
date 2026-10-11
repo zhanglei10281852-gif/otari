@@ -1,0 +1,10 @@
+项目：mozilla-ai-otari-0c4c4a7a-a5fd-4c5c-8a1d-bfc22969f3b8｜动态限流规则重建的代际隔离
+Session：6ac9b91ca4393268b21cc6c1｜有效轮数：106｜完成度：完成｜收录：长程题
+验证摘要：架构检查通过；73 个专项单元测试、16 个规则 API 集成测试、20 个迁移与真实 Redis 检查通过。
+Rubric ID：1｜状态：通过｜期望行为：同名删除重建获得新持久代际并从空容量开始。｜实际观察：StoredRateLimitRule 新建时生成 uuid4 hex generation，DELETE 后 POST 创建新行；RPM、TPM 和并发 key 均包含新代际。｜直接证据：重建空窗口单元与集成用例通过；src/gateway/models/rate_limits.py:33-38；src/gateway/rate_limit.py:309-377。
+Rubric ID：2｜状态：通过｜期望行为：PATCH 保留代际和原窗口、lease。｜实际观察：PATCH 仅应用请求字段，不写 generation；准入 key 继续使用原 generation，既有窗口与并发 lease 延续。｜直接证据：编辑保持 generation 集成用例和 PATCH 计数单元用例通过；src/gateway/services/rate_limits/_service.py:74-101。
+Rubric ID：3｜状态：通过｜期望行为：旧代迟到 settle 和 release 只操作旧代。｜实际观察：准入时把含 generation 的完整 TPM 与 concurrent key 保存到 hold，settle 和 release 直接使用保存的 key。｜直接证据：旧代迟到 settle、release 及 per-model 隔离单元用例通过；src/gateway/rate_limit.py:250-259、341-377。
+Rubric ID：4｜状态：通过｜期望行为：overlay、多副本、重启和升级前规则保持稳定代际。｜实际观察：overlay 从数据库行复制 generation；现存非空 generation 随行持久化，升级前 NULL 行持续使用确定的 legacy name-only key。｜直接证据：overlay 映射、多副本刷新、迁移单头与 schema parity 检查通过；src/gateway/services/rate_limits/_overlay.py:28-46。
+Rubric ID：5｜状态：通过｜期望行为：Redis、内存与故障恢复 handle 均按签发代际结算。｜实际观察：Redis 与内存 store 接收相同完整代际 key；fallback handle 带 local 前缀并在 Redis 恢复后仍路由回本地 store。｜直接证据：故障期间签发恢复后结算单元用例及 8 个真实 Redis 行为用例通过。
+Rubric ID：6｜状态：通过｜期望行为：旧代清理失败不影响 CRUD，新代不被误删。｜实际观察：规则 create、update、delete 不调用计数 store 清理；旧 key 由窗口 TTL、lease TTL 与本地清扫自然回收，新代 key 不相同。｜直接证据：src/gateway/services/rate_limits/_service.py:57-113；清理独立性单元用例通过。
+Rubric ID：7｜状态：通过｜期望行为：配置规则只读并保留既有隔离、429 与默认语义。｜实际观察：配置规则 generation 为 NULL 且 CRUD 仍拒绝同名配置规则；subject/model key、429 detail 与 Retry-After 构造未改变。｜直接证据：配置只读 API、subject/model、429 和 Retry-After 回归用例通过。
