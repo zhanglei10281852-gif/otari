@@ -33,6 +33,7 @@ from gateway.services.batch_service import (
     claim_batch_accounting,
     get_batch_record,
     get_batch_records,
+    mark_batch_settled,
     record_batch,
 )
 from gateway.services.budgets import (
@@ -42,6 +43,7 @@ from gateway.services.budgets import (
     refund_reservation,
     reserve_budget,
 )
+from gateway.services.inference import USAGE_ENDPOINT_RESULTS, resolve_batch_provider
 from gateway.services.log_writer import LogWriter
 from gateway.services.model_access import (
     is_model_allowed,
@@ -61,7 +63,6 @@ router = APIRouter(prefix="/batches", tags=["batches"])
 
 # See chat.USAGE_ENDPOINT.
 USAGE_ENDPOINT = "/v1/batches"
-USAGE_ENDPOINT_RESULTS = "/v1/batches/results"
 
 # Metadata key stamped on provider batches at creation time so ownership can be
 # checked on retrieve/cancel/results. The gateway stores no batch table, so the
@@ -152,42 +153,24 @@ async def log_batch_usage(
 # ---------------------------------------------------------------------------
 
 
-def _parse_provider(provider: str) -> LLMProvider:
-    """Parse a provider string into an LLMProvider enum, raising 400 on invalid values."""
-    try:
-        return LLMProvider.from_string(provider)
-    except UnsupportedProviderError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        ) from e
-
-
 def _resolve_batch_provider(
     config: GatewayConfig, provider: str, *, workspace_id: uuid.UUID | None = None
 ) -> tuple[LLMProvider, dict[str, Any]]:
     """Resolve a batch ``provider`` query param into (implementation, kwargs).
 
-    The value is either a configured instance name (resolved to its
-    ``provider_type`` with the instance's credentials) or a real any-llm
-    provider, mirroring what ``create_batch`` echoes back as the batch's
-    ``provider`` field. ``workspace_id`` reaches ``get_provider_kwargs``
-    unchanged: consulted only when ``provider`` names no configured instance,
-    the same organization-scoped fallback ``create_batch`` uses, so a batch
-    created against an organization key stays reachable by every later
-    lifecycle call (retrieve, cancel, list, results) rather than only at
-    creation. For retrieve/cancel/results the caller passes the batch's own
-    stored ``workspace_id`` (see ``_lifecycle_workspace_id``), not necessarily
-    its own current one, so credentials resolve from the organization that
-    created the batch even for a master-key or cross-workspace call;
-    ``list_batches`` has no batch id to key off of and keeps using the
-    caller's own workspace.
+    Resolution itself (a configured instance with its credentials, or a
+    provider with the origin workspace's organization overlay) lives in the
+    inference service so the background worker and this route resolve
+    credentials identically. The one thing kept here is mapping a bad provider
+    value to the route's 400 response.
     """
-    if provider in config.providers:
-        impl = LLMProvider(config.provider_instance_type(provider))
-        return impl, get_provider_kwargs(config, impl, instance=provider)
-    impl = _parse_provider(provider)
-    return impl, get_provider_kwargs(config, impl, workspace_id=workspace_id)
+    try:
+        return resolve_batch_provider(config, provider, workspace_id=workspace_id)
+    except UnsupportedProviderError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
 
 
 async def _lifecycle_workspace_id(db: AsyncSession, record: BatchRecord | None, api_key: APIKey | None) -> uuid.UUID:
@@ -843,6 +826,9 @@ async def retrieve_batch_results(
             workspace_id=origin_workspace_id,
         )
         if record is not None:
+            # The local settled state is staged with the claim, so the batch
+            # stops looking due to the background worker even where it is off.
+            await mark_batch_settled(db, batch_id)
             if cost and user_id and not batch_exempt:
                 # Folds the spend and commits the claim in one transaction.
                 await record_external_spend(db, user_id, cost)

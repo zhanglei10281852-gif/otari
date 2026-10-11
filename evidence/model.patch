@@ -1,0 +1,2320 @@
+diff --git a/alembic/versions/d9e2f4a6b8c0_add_batch_settlement_state.py b/alembic/versions/d9e2f4a6b8c0_add_batch_settlement_state.py
+new file mode 100644
+index 00000000..50bd44f9
+--- /dev/null
++++ b/alembic/versions/d9e2f4a6b8c0_add_batch_settlement_state.py
+@@ -0,0 +1,60 @@
++"""Add local lifecycle and leasing columns to batches for background settlement.
++
++The background worker advances locally-recorded batches itself: it claims a
++polling lease, prices and bills a completed batch exactly once, and leaves a
++distinct local terminal for failed/cancelled/expired ones. Existing rows are
++seeded ``in_progress`` so they are discovered, while the manual GET results
++path keeps its current behavior and stays the fallback when the worker is off.
++
++Revision ID: d9e2f4a6b8c0
++Revises: c7e1a4d9b3f2
++Create Date: 2026-10-10 00:00:00.000000
++
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = "d9e2f4a6b8c0"
++down_revision: str | Sequence[str] | None = "c7e1a4d9b3f2"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    """Upgrade schema."""
++    op.add_column("batches", sa.Column("lease_owner", sa.String(length=36), nullable=True))
++    op.add_column("batches", sa.Column("lease_token", sa.String(length=36), nullable=True))
++    op.add_column("batches", sa.Column("leased_until", sa.DateTime(timezone=True), nullable=True))
++    op.add_column("batches", sa.Column("next_poll_at", sa.DateTime(timezone=True), nullable=True))
++    op.add_column("batches", sa.Column("last_error", sa.Text(), nullable=True))
++    # Server defaults seed every existing row: they become in_progress with a
++    # zero attempt count, the same shape newly created rows have.
++    op.add_column(
++        "batches",
++        sa.Column("local_status", sa.String(length=16), nullable=False, server_default="in_progress"),
++    )
++    op.add_column(
++        "batches",
++        sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
++    )
++    op.create_index(op.f("ix_batches_local_status"), "batches", ["local_status"], unique=False)
++    op.create_index(op.f("ix_batches_leased_until"), "batches", ["leased_until"], unique=False)
++    op.create_index(op.f("ix_batches_next_poll_at"), "batches", ["next_poll_at"], unique=False)
++
++
++def downgrade() -> None:
++    """Downgrade schema."""
++    op.drop_index(op.f("ix_batches_next_poll_at"), table_name="batches")
++    op.drop_index(op.f("ix_batches_leased_until"), table_name="batches")
++    op.drop_index(op.f("ix_batches_local_status"), table_name="batches")
++    op.drop_column("batches", "attempt_count")
++    op.drop_column("batches", "local_status")
++    op.drop_column("batches", "last_error")
++    op.drop_column("batches", "next_poll_at")
++    op.drop_column("batches", "leased_until")
++    op.drop_column("batches", "lease_token")
++    op.drop_column("batches", "lease_owner")
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 3b962ce4..03d53546 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -90,6 +90,11 @@ the corresponding startup value after the database is available.
+ | `rate_limit_redis_url` | The Redis that the `redis` store counts in. |
+ | `rate_limits` | Requests per minute, tokens per minute and requests in flight, per deployment, API key, user or model. Also managed from the dashboard. See [Rate limit rules](#rate-limit-rules). |
+ | `idempotency_retention_sec` | How long a completion sent with an `Idempotency-Key` is kept for a retry to replay. Defaults to a day; `0` ignores the header. Needs `OTARI_SECRET_KEY`, which encrypts the stored response. See [Retrying safely](api-reference.md#retrying-safely). |
++| `batch_settlement_enabled` | Advance and bill locally-recorded batches in the background, so a client never has to read results for usage and spend to land. Defaults to `true`; off keeps settlement on the first `GET` results as before. Not available in hybrid mode. |
++| `batch_settlement_interval_sec` | How often the background worker looks for batches due a poll. Defaults to a minute. |
++| `batch_settlement_batch_size` | How many due batches one worker tick advances. Defaults to 10. |
++| `batch_settlement_lease_sec` | How long one gateway holds a batch's polling lease; past this another replica may claim it if the worker stalled. Defaults to a minute. |
++| `batch_settlement_backoff_base_sec`, `batch_settlement_backoff_cap_sec` | Base wait before re-polling a still-running or temporarily obstructed batch (it doubles each retry) and the largest wait, defaulting to 10 seconds and 30 minutes. |
+ | `enable_metrics` | Serve Prometheus metrics at `/metrics`. Needs the `metrics` extra (`pip install gateway[metrics]`), which the Docker image installs; setting this without it refuses to start. |
+ | `accept_incoming_trace_context` | Join spans the gateway creates to the caller's trace. Defaults to `false`. See [Trace context propagation](#trace-context-propagation). |
+ | `enable_docs` | Serve OpenAPI, Swagger UI, and ReDoc. |
+diff --git a/scripts/check_architecture.py b/scripts/check_architecture.py
+index 2753ec3a..b2e5e84f 100644
+--- a/scripts/check_architecture.py
++++ b/scripts/check_architecture.py
+@@ -1507,7 +1507,7 @@ MODEL_ACCESS: dict[str, ModelAccess] = {
+         "baseline": ("gateway/services/tenancy/organization_guardrail_service.py",),
+     },
+     "gateway.models.inference.BatchRecord": {
+-        "repository": None,
++        "repository": "gateway/repositories/inference/batch_repository.py",
+         "baseline": ("gateway/services/batch_service.py",),
+     },
+     "gateway.models.inference.IdempotencyRecord": {
+@@ -1769,6 +1769,7 @@ MODEL_ACCESS: dict[str, ModelAccess] = {
+             "gateway/api/routes/search.py",
+             "gateway/api/routes/usage.py",
+             "gateway/api/routes/users.py",
++            "gateway/repositories/inference/batch_repository.py",
+             "gateway/repositories/users_repository.py",
+             "gateway/services/external_usage_service.py",
+             "gateway/services/tenancy/workspace_activation_service.py",
+diff --git a/src/gateway/api/deps.py b/src/gateway/api/deps.py
+index 784687b6..a6c85ff3 100644
+--- a/src/gateway/api/deps.py
++++ b/src/gateway/api/deps.py
+@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
+ from contextlib import aclosing
+ from dataclasses import dataclass
+ from datetime import UTC, datetime
++from decimal import Decimal
+ from typing import Annotated
+ 
+ from fastapi import Depends, HTTPException, Request, status
+@@ -19,6 +20,7 @@ from gateway.core.unit_of_work import UnitOfWork
+ from gateway.log_config import logger
+ from gateway.metrics import REGISTRY, Counter
+ from gateway.models.api_keys import APIKey
++from gateway.models.pricing import ModelPricing
+ from gateway.models.tenancy import User as TenancyUser
+ from gateway.ports.agent_model_recommender_port import AgentModelRecommenderPort
+ from gateway.ports.api_key_format_port import ApiKeyFormatPort, Malformed, Misdirected
+@@ -53,17 +55,18 @@ from gateway.repositories.tools import (
+ )
+ from gateway.repositories.users_repository import get_active_user
+ from gateway.services.api_keys import ApiKeyService
+-from gateway.services.budgets import BudgetMembershipListener, BudgetService
++from gateway.services.budgets import BudgetMembershipListener, BudgetService, record_external_spend
+ from gateway.services.code_execution import SandboxContainerRegistry
+ from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, resolve_dashboard_session
+ from gateway.services.feedback import FeedbackService
+ from gateway.services.files import FileBackends, FileService, SandboxFileBridge, StagedFile
+-from gateway.services.inference import IdempotencyService
++from gateway.services.inference import BatchSettlementService, IdempotencyService
+ from gateway.services.log_writer import LogWriter
+ from gateway.services.master_key_service import hash_master_key, is_generated_master_key, load_master_key_hash
+ from gateway.services.organization_pricing_service import OrganizationPricingService
+ from gateway.services.overview import OverviewService
+ from gateway.services.playground_service import ForwardedToolOffer, LocalToolOffer, PlaygroundToolOffer
++from gateway.services.pricing_service import find_model_pricing
+ from gateway.services.providers import OrgProviderModelService, ProviderEndpointService, refresh_provider_endpoint_cache
+ from gateway.services.rate_limits import RateLimitService
+ from gateway.services.routing import clear_router_backend_cache
+@@ -85,7 +88,11 @@ from gateway.services.tools import (
+     WorkspaceCodeExecutionPolicyService,
+     WorkspaceSearchKeys,
+ )
+-from gateway.services.workspace_scope import default_workspace_id
++from gateway.services.workspace_scope import (
++    default_workspace_id,
++    organization_for_workspace_id,
++    workspace_for_key_id,
++)
+ 
+ # Legacy module-level fallback. Config now lives on ``app.state.config`` (set in
+ # ``create_app``); ``get_config`` reads from the request's app state and only
+@@ -716,6 +723,64 @@ def build_idempotency_service(uow: UnitOfWork, config: GatewayConfig) -> Idempot
+     return IdempotencyService(uow, InferenceRepositories.on(uow), config)
+ 
+ 
++class _BatchSettlementPortsAdapter:
++    """Bind the settlement worker's ports onto its tick's session.
++
++    The old-shape pricing and budgets functions still take the session
++    directly; this adapter is the one place that names it for them, while the
++    service itself keeps going through its repositories.
++    """
++
++    def __init__(self, db: AsyncSession) -> None:
++        self._db = db
++
++    async def find_pricing(
++        self,
++        provider: str,
++        model: str,
++        organization_id: uuid.UUID | None,
++    ) -> ModelPricing | None:
++        return await find_model_pricing(self._db, provider, model, organization_id=organization_id)
++
++    async def fold_spend(self, user_id: str, cost: Decimal) -> None:
++        await record_external_spend(self._db, user_id, cost)
++
++    async def workspace_for_key(self, api_key_id: str | None) -> uuid.UUID:
++        return await workspace_for_key_id(self._db, api_key_id)
++
++    async def organization_for_workspace(
++        self,
++        workspace_id: uuid.UUID | None,
++    ) -> uuid.UUID | None:
++        return await organization_for_workspace_id(self._db, workspace_id)
++
++    async def origin_key_exempt(self, api_key_id: str | None) -> bool:
++        # A deleted originating key defaults to enforced, the conservative choice.
++        if api_key_id is None:
++            return False
++        origin_key = await self._db.get(APIKey, api_key_id)
++        return origin_key is not None and origin_key.exclude_from_budget
++
++
++def build_batch_settlement_service(
++    uow: UnitOfWork,
++    db: AsyncSession,
++    config: GatewayConfig,
++    log_writer: LogWriter,
++    *,
++    owner: str,
++) -> BatchSettlementService:
++    """Build the background batch settlement service for one worker tick."""
++    return BatchSettlementService(
++        uow,
++        InferenceRepositories.on(uow),
++        _BatchSettlementPortsAdapter(db),
++        config,
++        log_writer,
++        owner=owner,
++    )
++
++
+ def build_sandbox_file_bridge(
+     *,
+     raw_request: Request,
+diff --git a/src/gateway/api/routes/batches.py b/src/gateway/api/routes/batches.py
+index 54551fbd..739a2b62 100644
+--- a/src/gateway/api/routes/batches.py
++++ b/src/gateway/api/routes/batches.py
+@@ -33,6 +33,7 @@ from gateway.services.batch_service import (
+     claim_batch_accounting,
+     get_batch_record,
+     get_batch_records,
++    mark_batch_settled,
+     record_batch,
+ )
+ from gateway.services.budgets import (
+@@ -42,6 +43,7 @@ from gateway.services.budgets import (
+     refund_reservation,
+     reserve_budget,
+ )
++from gateway.services.inference import USAGE_ENDPOINT_RESULTS, resolve_batch_provider
+ from gateway.services.log_writer import LogWriter
+ from gateway.services.model_access import (
+     is_model_allowed,
+@@ -61,7 +63,6 @@ router = APIRouter(prefix="/batches", tags=["batches"])
+ 
+ # See chat.USAGE_ENDPOINT.
+ USAGE_ENDPOINT = "/v1/batches"
+-USAGE_ENDPOINT_RESULTS = "/v1/batches/results"
+ 
+ # Metadata key stamped on provider batches at creation time so ownership can be
+ # checked on retrieve/cancel/results. The gateway stores no batch table, so the
+@@ -152,42 +153,24 @@ async def log_batch_usage(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _parse_provider(provider: str) -> LLMProvider:
+-    """Parse a provider string into an LLMProvider enum, raising 400 on invalid values."""
+-    try:
+-        return LLMProvider.from_string(provider)
+-    except UnsupportedProviderError as e:
+-        raise HTTPException(
+-            status_code=status.HTTP_400_BAD_REQUEST,
+-            detail=str(e),
+-        ) from e
+-
+-
+ def _resolve_batch_provider(
+     config: GatewayConfig, provider: str, *, workspace_id: uuid.UUID | None = None
+ ) -> tuple[LLMProvider, dict[str, Any]]:
+     """Resolve a batch ``provider`` query param into (implementation, kwargs).
+ 
+-    The value is either a configured instance name (resolved to its
+-    ``provider_type`` with the instance's credentials) or a real any-llm
+-    provider, mirroring what ``create_batch`` echoes back as the batch's
+-    ``provider`` field. ``workspace_id`` reaches ``get_provider_kwargs``
+-    unchanged: consulted only when ``provider`` names no configured instance,
+-    the same organization-scoped fallback ``create_batch`` uses, so a batch
+-    created against an organization key stays reachable by every later
+-    lifecycle call (retrieve, cancel, list, results) rather than only at
+-    creation. For retrieve/cancel/results the caller passes the batch's own
+-    stored ``workspace_id`` (see ``_lifecycle_workspace_id``), not necessarily
+-    its own current one, so credentials resolve from the organization that
+-    created the batch even for a master-key or cross-workspace call;
+-    ``list_batches`` has no batch id to key off of and keeps using the
+-    caller's own workspace.
++    Resolution itself (a configured instance with its credentials, or a
++    provider with the origin workspace's organization overlay) lives in the
++    inference service so the background worker and this route resolve
++    credentials identically. The one thing kept here is mapping a bad provider
++    value to the route's 400 response.
+     """
+-    if provider in config.providers:
+-        impl = LLMProvider(config.provider_instance_type(provider))
+-        return impl, get_provider_kwargs(config, impl, instance=provider)
+-    impl = _parse_provider(provider)
+-    return impl, get_provider_kwargs(config, impl, workspace_id=workspace_id)
++    try:
++        return resolve_batch_provider(config, provider, workspace_id=workspace_id)
++    except UnsupportedProviderError as e:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail=str(e),
++        ) from e
+ 
+ 
+ async def _lifecycle_workspace_id(db: AsyncSession, record: BatchRecord | None, api_key: APIKey | None) -> uuid.UUID:
+@@ -843,6 +826,9 @@ async def retrieve_batch_results(
+             workspace_id=origin_workspace_id,
+         )
+         if record is not None:
++            # The local settled state is staged with the claim, so the batch
++            # stops looking due to the background worker even where it is off.
++            await mark_batch_settled(db, batch_id)
+             if cost and user_id and not batch_exempt:
+                 # Folds the spend and commits the claim in one transaction.
+                 await record_external_spend(db, user_id, cost)
+diff --git a/src/gateway/core/settings/inference.py b/src/gateway/core/settings/inference.py
+index 614f400e..3d26960e 100644
+--- a/src/gateway/core/settings/inference.py
++++ b/src/gateway/core/settings/inference.py
+@@ -34,3 +34,42 @@ class InferenceSettings(BaseModel):
+         ge=1,
+         description="How often expired idempotency records are deleted.",
+     )
++
++    batch_settlement_enabled: Annotated[bool, OMITTED] = Field(
++        default=True,
++        description=(
++            "Whether locally-recorded batches are advanced and billed in the background without a client "
++            "reading results. Off keeps settlement on the first GET results retrieval as before. "
++            "Not available in hybrid mode."
++        ),
++    )
++    batch_settlement_interval_sec: Annotated[int, OMITTED] = Field(
++        default=60,
++        ge=1,
++        description="How often the background worker looks for batches due a poll.",
++    )
++    batch_settlement_batch_size: Annotated[int, OMITTED] = Field(
++        default=10,
++        ge=1,
++        description="How many due batches one worker tick advances.",
++    )
++    batch_settlement_lease_sec: Annotated[int, OMITTED] = Field(
++        default=60,
++        ge=10,
++        description=(
++            "How long one gateway's polling lease on a batch stays valid. Past this, another replica may "
++            "claim the batch if the worker holding it stalled."
++        ),
++    )
++    batch_settlement_backoff_base_sec: Annotated[int, OMITTED] = Field(
++        default=10,
++        ge=1,
++        description=(
++            "Base delay before re-polling a still-running or temporarily obstructed batch; it doubles each retry."
++        ),
++    )
++    batch_settlement_backoff_cap_sec: Annotated[int, OMITTED] = Field(
++        default=1800,
++        ge=5,
++        description="Largest delay between polls of a batch, so retries are bounded and never busy-loop.",
++    )
+diff --git a/src/gateway/core/unit_of_work.py b/src/gateway/core/unit_of_work.py
+index 20bf0a02..901bee53 100644
+--- a/src/gateway/core/unit_of_work.py
++++ b/src/gateway/core/unit_of_work.py
+@@ -112,11 +112,26 @@ async def create_log_unit_of_work() -> AsyncIterator[UnitOfWork]:
+         yield UnitOfWork(session)
+ 
+ 
++@asynccontextmanager
++async def create_worker_unit_of_work() -> AsyncIterator[tuple[UnitOfWork, AsyncSession]]:
++    """Yield a worker's Unit of Work and its session together.
++
++    For a worker job whose service wires old-shape helpers onto its session
++    (the spend fold and pricing lookup still take the session directly). The
++    session stays with the composition code that builds the service; the
++    service itself reaches the database through its repositories and never
++    names it.
++    """
++    async with create_session() as session:
++        yield UnitOfWork(session), session
++
++
+ __all__ = [
+     "OutsideUnitOfWorkError",
+     "UnitOfWork",
+     "UnitOfWorkRolledBackError",
+     "create_log_unit_of_work",
+     "create_unit_of_work",
++    "create_worker_unit_of_work",
+     "session_for",
+ ]
+diff --git a/src/gateway/main.py b/src/gateway/main.py
+index efa2c387..19ef228c 100644
+--- a/src/gateway/main.py
++++ b/src/gateway/main.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import functools
+ import importlib.util
++import uuid
+ from collections.abc import AsyncGenerator, Coroutine
+ from contextlib import asynccontextmanager
+ from dataclasses import dataclass
+@@ -22,6 +23,7 @@ import any_fetch
+ import any_search
+ from gateway import features
+ from gateway.api.deps import (
++    build_batch_settlement_service,
+     build_file_service,
+     build_idempotency_service,
+     get_membership_listener,
+@@ -38,6 +40,7 @@ from gateway.core.database import create_session, dispose_db, init_db
+ from gateway.core.error_codes import error_code_of, error_headers
+ from gateway.core.feature import Worker
+ from gateway.core.settings.tools import warn_about_tool_instances
++from gateway.core.unit_of_work import create_worker_unit_of_work
+ from gateway.dashboard import DASHBOARD_PACKAGE_PATH, get_dashboard_build_id, get_dashboard_dir
+ from gateway.exceptions import TenancyError
+ from gateway.exceptions.control_plane_exceptions import ControlPlaneError
+@@ -58,7 +61,11 @@ from gateway.services.code_execution.container_sweeper import run_sandbox_contai
+ from gateway.services.dashboard_session_service import revoke_sessions_on_master_key_change
+ from gateway.services.feedback import new_feedback_rate_limiter
+ from gateway.services.files import FileBackends, run_file_sweeper
+-from gateway.services.inference import close_decision_client, run_idempotency_sweeper
++from gateway.services.inference import (
++    close_decision_client,
++    run_batch_settlement_worker,
++    run_idempotency_sweeper,
++)
+ from gateway.services.log_writer import LogWriter, NoopLogWriter, create_log_writer
+ from gateway.services.master_key_service import ensure_master_key
+ from gateway.services.model_catalog_service import (
+@@ -245,6 +252,29 @@ def _start_idempotency_sweeper(config: GatewayConfig, _container: Container) ->
+     )
+ 
+ 
++def _build_batch_settlement(
++    config: GatewayConfig,
++    log_writer: LogWriter,
++) -> Coroutine[Any, Any, None] | None:
++    """Return the background batch settlement loop, or None when it is disabled.
++
++    Separate from the worker registry because the loop needs the started
++    log writer (its usage row goes through that writer), which exists only once
++    the lifespan reaches this point. The owner id is this process's identity
++    for polling leases and stays constant for the process's lifetime.
++    """
++    if not config.batch_settlement_enabled or config.batch_settlement_interval_sec <= 0:
++        return None
++    owner = str(uuid.uuid4())
++
++    async def _tick() -> None:
++        async with create_worker_unit_of_work() as (uow, db):
++            service = build_batch_settlement_service(uow, db, config, log_writer, owner=owner)
++            await service.run_once(limit=config.batch_settlement_batch_size)
++
++    return run_batch_settlement_worker(config.batch_settlement_interval_sec, _tick)
++
++
+ def _start_container_sweeper(config: GatewayConfig, _container: Container) -> Coroutine[Any, Any, None] | None:
+     """Return the sandbox container sweep, or None when no sandbox is held past its request."""
+     if not config.sandbox_configured() or config.sandbox_container_idle_ttl_sec <= 0:
+@@ -644,6 +674,7 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
+         log_writer: LogWriter
+         workers: list[tuple[asyncio.Task[None], _LifespanWorker]] = []
+         feature_workers: list[tuple[asyncio.Task[None], str]] = []
++        batch_settlement_worker: tuple[asyncio.Task[None], str] | None = None
+         if config.is_hybrid_mode:
+             log_writer = NoopLogWriter()
+             # No stored search tools or tool settings to wait for on a hybrid gateway.
+@@ -735,6 +766,15 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
+                 if feature.worker is not None
+             ]
+ 
++            # Started here rather than the worker registry because it needs the
++            # log writer built above; its task joins the same shutdown group.
++            batch_settlement = _build_batch_settlement(config, log_writer)
++            if batch_settlement is not None:
++                batch_settlement_worker = (
++                    asyncio.create_task(batch_settlement),
++                    "batch settlement worker",
++                )
++
+         # Start the writer inside the try so a failure here still runs the cleanup
+         # below; the refresher tasks are already created and would otherwise leak.
+         log_writer_started = False
+@@ -744,7 +784,10 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
+             app.state.log_writer = log_writer
+             yield
+         finally:
+-            await _stop_refreshers([(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers)
++            refreshers = [(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers
++            if batch_settlement_worker is not None:
++                refreshers.append(batch_settlement_worker)
++            await _stop_refreshers(refreshers)
+             for _task, worker in workers:
+                 if worker.reset is not None:
+                     worker.reset()
+diff --git a/src/gateway/models/inference.py b/src/gateway/models/inference.py
+index 8b810dd9..0d9c27c8 100644
+--- a/src/gateway/models/inference.py
++++ b/src/gateway/models/inference.py
+@@ -10,6 +10,22 @@ from sqlalchemy.orm import Mapped, mapped_column
+ from gateway.models.base import Base
+ 
+ 
++class BatchLocalStatus(StrEnum):
++    """The local lifecycle state of a recorded batch, independent of the provider's.
++
++    IN_PROGRESS batches are advanced by the background settlement worker under a
++    polling lease; SETTLED is a billed, completed batch; FAILED, CANCELLED and
++    EXPIRED are the distinct local terminals for provider batches that produced
++    no result charges and are never polled again.
++    """
++
++    IN_PROGRESS = "in_progress"
++    SETTLED = "settled"
++    FAILED = "failed"
++    CANCELLED = "cancelled"
++    EXPIRED = "expired"
++
++
+ class BatchRecord(Base):
+     """Ownership and accounting record for an asynchronous batch job.
+ 
+@@ -55,6 +71,25 @@ class BatchRecord(Base):
+     # NULL until the first completed results retrieval accounts the batch; the
+     # atomic NULL -> now transition is the idempotency gate for billing/logging.
+     results_accounted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
++    # Local lifecycle state (see :class:`BatchLocalStatus`). Rows written before
++    # this column existed are seeded IN_PROGRESS, so the background worker picks
++    # them up and the manual results path stays the fallback when it is disabled.
++    local_status: Mapped[str] = mapped_column(
++        String(16), default=BatchLocalStatus.IN_PROGRESS, server_default=BatchLocalStatus.IN_PROGRESS, index=True
++    )
++    # Polling lease: which gateway process holds the batch, the token for that
++    # one claim (changes on every claim, so a superseded owner cannot settle a
++    # lease it lost), and when the lease lapses for another replica to take it.
++    lease_owner: Mapped[str | None] = mapped_column(String(36))
++    lease_token: Mapped[str | None] = mapped_column(String(36))
++    leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
++    # Bounded-backoff schedule: earliest time the batch is due another poll,
++    # and how many polls have run (drives the exponential delay).
++    next_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
++    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
++    # Last transient obstruction (provider 429/5xx, missing pricing, DB error),
++    # for operators; NULL on a healthy batch.
++    last_error: Mapped[str | None] = mapped_column(Text)
+ 
+ 
+ IDEMPOTENCY_TABLE = "idempotency_keys"
+diff --git a/src/gateway/repositories/inference/batch_repository.py b/src/gateway/repositories/inference/batch_repository.py
+new file mode 100644
+index 00000000..3e28e5b7
+--- /dev/null
++++ b/src/gateway/repositories/inference/batch_repository.py
+@@ -0,0 +1,221 @@
++"""Data access for locally-recorded batches driven by the settlement worker."""
++
++from __future__ import annotations
++
++import uuid
++from datetime import datetime
++from typing import Any, Never, cast
++
++from sqlalchemy import func, or_, select, update
++from sqlalchemy.engine import CursorResult
++
++from gateway.core.unit_of_work import UnitOfWork
++from gateway.models.inference import BatchLocalStatus, BatchRecord
++from gateway.models.usage import UsageLog
++from gateway.repositories.base_repository import BaseRepository
++
++
++class BatchRepository(BaseRepository[BatchRecord, Never, Never]):
++    """Discover, lease and finish recorded batches in the open block of a Unit of Work."""
++
++    def __init__(self, uow: UnitOfWork) -> None:
++        super().__init__(uow, BatchRecord)
++
++    async def list_due(self, now: datetime, *, limit: int) -> list[BatchRecord]:
++        """Return in-progress batches that are unleased (or lapsed) and due a poll.
++
++        The lease claim, not this read, serializes replicas: two gateways may
++        read the same batch, but only one claims it. Oldest due first, by the
++        originating created time where no poll has been scheduled.
++        """
++        result = await self.db.execute(
++            select(BatchRecord)
++            .where(
++                BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS,
++                or_(BatchRecord.leased_until.is_(None), BatchRecord.leased_until <= now),
++                or_(BatchRecord.next_poll_at.is_(None), BatchRecord.next_poll_at <= now),
++            )
++            .order_by(func.coalesce(BatchRecord.next_poll_at, BatchRecord.created_at))
++            .limit(limit)
++        )
++        return list(result.scalars().all())
++
++    async def claim_lease(
++        self,
++        batch_id: str,
++        *,
++        owner: str,
++        token: str,
++        now: datetime,
++        lease_end: datetime,
++    ) -> bool:
++        """Claim the one polling lease for a batch, committing before any provider call.
++
++        Matches while the batch is in progress and the lease is free, lapsed, or
++        already this owner's. The UPDATE takes the row lock at once, so a
++        concurrent claim on another gateway loses. If this owner later stalls
++        mid-poll, the lease lapses at ``lease_end`` and another replica claims
++        with a new token.
++        """
++        result = cast(
++            "CursorResult[Any]",
++            await self.db.execute(
++                update(BatchRecord)
++                .where(
++                    BatchRecord.id == batch_id,
++                    BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS,
++                    or_(
++                        BatchRecord.leased_until.is_(None),
++                        BatchRecord.leased_until <= now,
++                        BatchRecord.lease_owner == owner,
++                    ),
++                )
++                .values(lease_owner=owner, lease_token=token, leased_until=lease_end, last_error=None)
++            ),
++        )
++        await self.db.flush()
++        return bool(result.rowcount)
++
++    async def claim_results(self, batch_id: str, *, now: datetime) -> bool:
++        """Claim the one-time results gate (NULL -> now), in the settlement transaction.
++
++        Same atomic transition the manual GET results path uses, so the two
++        racing each other cannot both bill: the winner logs usage and folds
++        spend, the loser sees False and only updates the local state.
++        """
++        result = cast(
++            "CursorResult[Any]",
++            await self.db.execute(
++                update(BatchRecord)
++                .where(BatchRecord.id == batch_id, BatchRecord.results_accounted_at.is_(None))
++                .values(results_accounted_at=now)
++            ),
++        )
++        await self.db.flush()
++        return bool(result.rowcount)
++
++    async def defer(
++        self,
++        batch_id: str,
++        *,
++        token: str,
++        attempt: int,
++        next_poll_at: datetime,
++        error: str | None,
++    ) -> bool:
++        """Schedule the bounded-backoff retry, holding the lease until the batch is due.
++
++        Tied to this claim's ``token`` so a worker whose lease was taken over
++        cannot move a batch the new owner now drives. The lease passes exactly
++        when the batch is due, letting any replica claim the retry.
++        """
++        result = cast(
++            "CursorResult[Any]",
++            await self.db.execute(
++                update(BatchRecord)
++                .where(
++                    BatchRecord.id == batch_id,
++                    BatchRecord.lease_token == token,
++                    BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS,
++                )
++                .values(
++                    attempt_count=attempt,
++                    next_poll_at=next_poll_at,
++                    leased_until=next_poll_at,
++                    last_error=error,
++                )
++            ),
++        )
++        await self.db.flush()
++        return bool(result.rowcount)
++
++    async def finish_terminal(self, batch_id: str, *, token: str, status: BatchLocalStatus) -> bool:
++        """Record a distinct local terminal for a batch that produced no result charges.
++
++        Reached for provider failed/cancelled/expired batches: no results are
++        fetched, no usage or spend is written, and the batch never enters the
++        due set again. The results billing gate stays NULL, only completed
++        batches set it; ``local_status`` is what marks the batch finished.
++        """
++        result = cast(
++            "CursorResult[Any]",
++            await self.db.execute(
++                update(BatchRecord)
++                .where(
++                    BatchRecord.id == batch_id,
++                    BatchRecord.lease_token == token,
++                    BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS,
++                )
++                .values(
++                    local_status=status,
++                    lease_owner=None,
++                    lease_token=None,
++                    leased_until=None,
++                    next_poll_at=None,
++                )
++            ),
++        )
++        await self.db.flush()
++        return bool(result.rowcount)
++
++    async def settle(self, batch_id: str, *, token: str) -> bool:
++        """Mark the batch locally settled and release its lease, in the billing transaction."""
++        result = cast(
++            "CursorResult[Any]",
++            await self.db.execute(
++                update(BatchRecord)
++                .where(
++                    BatchRecord.id == batch_id,
++                    BatchRecord.lease_token == token,
++                    BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS,
++                )
++                .values(
++                    local_status=BatchLocalStatus.SETTLED,
++                    lease_owner=None,
++                    lease_token=None,
++                    leased_until=None,
++                    next_poll_at=None,
++                )
++            ),
++        )
++        await self.db.flush()
++        return bool(result.rowcount)
++
++    def build_results_usage_log(
++        self,
++        *,
++        record: BatchRecord,
++        model: str,
++        workspace_id: Any,
++        prompt_tokens: int,
++        completion_tokens: int,
++        total_tokens: int,
++        cache_read_tokens: int,
++        cost: Any,
++        counts_toward_budget: bool,
++        now: datetime,
++    ) -> UsageLog:
++        """Construct the batch results usage row with all attribution resolved.
++
++        Built here rather than in the service because it is a row of the usage
++        table; every value follows the creator (workspace, model, cost), while
++        ``api_key_id`` records the originating key. The caller puts it through
++        the log writer in the same transaction as the results claim.
++        """
++        return UsageLog(
++            id=str(uuid.uuid4()),
++            workspace_id=workspace_id,
++            api_key_id=record.api_key_id,
++            user_id=record.user_id,
++            timestamp=now,
++            model=model,
++            provider=record.provider,
++            endpoint="/v1/batches/results",
++            prompt_tokens=prompt_tokens,
++            completion_tokens=completion_tokens,
++            total_tokens=total_tokens,
++            cache_read_tokens=cache_read_tokens,
++            cost=cost,
++            status="success",
++            counts_toward_budget=counts_toward_budget,
++        )
+diff --git a/src/gateway/repositories/inference/inference_repositories.py b/src/gateway/repositories/inference/inference_repositories.py
+index 745882d4..14802d5a 100644
+--- a/src/gateway/repositories/inference/inference_repositories.py
++++ b/src/gateway/repositories/inference/inference_repositories.py
+@@ -4,6 +4,7 @@ from dataclasses import dataclass
+ from typing import Self
+ 
+ from gateway.core.unit_of_work import UnitOfWork
++from gateway.repositories.inference.batch_repository import BatchRepository
+ from gateway.repositories.inference.idempotency_repository import IdempotencyRepository
+ 
+ 
+@@ -12,8 +13,9 @@ class InferenceRepositories:
+     """The inference domain's repositories, all on one Unit of Work."""
+ 
+     idempotency: IdempotencyRepository
++    batch: BatchRepository
+ 
+     @classmethod
+     def on(cls, uow: UnitOfWork) -> Self:
+         """Build every repository on this Unit of Work."""
+-        return cls(idempotency=IdempotencyRepository(uow))
++        return cls(idempotency=IdempotencyRepository(uow), batch=BatchRepository(uow))
+diff --git a/src/gateway/services/batch_service.py b/src/gateway/services/batch_service.py
+index c29d52f0..3946badf 100644
+--- a/src/gateway/services/batch_service.py
++++ b/src/gateway/services/batch_service.py
+@@ -15,7 +15,7 @@ from sqlalchemy import select, update
+ from sqlalchemy.exc import SQLAlchemyError
+ 
+ from gateway.log_config import logger
+-from gateway.models.inference import BatchRecord
++from gateway.models.inference import BatchLocalStatus, BatchRecord
+ 
+ if TYPE_CHECKING:
+     import uuid
+@@ -100,3 +100,24 @@ async def claim_batch_accounting(db: AsyncSession, batch_id: str) -> bool:
+     # getattr with a default: mypy sees .execute() as Result (no rowcount);
+     # rowcount lives on CursorResult. Matches reserve_budget/_cas_reset_user_budget.
+     return bool(getattr(result, "rowcount", 0))
++
++
++async def mark_batch_settled(db: AsyncSession, batch_id: str) -> None:
++    """Record the local settled state in the same transaction as a successful claim.
++
++    No commit: it is staged alongside the results gate and the spend fold so
++    the three stay atomic, and the batch stops looking due to the background
++    worker even where background settlement itself is disabled.
++    """
++    await db.execute(
++        update(BatchRecord)
++        .where(BatchRecord.id == batch_id, BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS)
++        .values(
++            local_status=BatchLocalStatus.SETTLED,
++            lease_owner=None,
++            lease_token=None,
++            leased_until=None,
++            next_poll_at=None,
++        )
++        .execution_options(synchronize_session=False)
++    )
+diff --git a/src/gateway/services/inference/__init__.py b/src/gateway/services/inference/__init__.py
+index a8022eb7..f211bbb6 100644
+--- a/src/gateway/services/inference/__init__.py
++++ b/src/gateway/services/inference/__init__.py
+@@ -1,5 +1,16 @@
+ """The inference domain: idempotent completion requests, structured decisions and dialect bridges."""
+ 
++from gateway.services.inference._batch_settlement import (
++    USAGE_ENDPOINT_RESULTS,
++    BatchSettlementPorts,
++    BatchSettlementService,
++    BatchTotals,
++    SettlementReport,
++    backoff_delay,
++    resolve_batch_provider,
++    summarize_batch_results,
++)
++from gateway.services.inference._batch_worker import run_batch_settlement_worker
+ from gateway.services.inference._decisions import (
+     DecisionProvider,
+     DecisionProviderError,
+@@ -35,7 +46,11 @@ from gateway.services.inference._sweeper import run_idempotency_sweeper
+ 
+ __all__ = [
+     "REASONING_ITEM_ID_PREFIX",
++    "USAGE_ENDPOINT_RESULTS",
+     "Admission",
++    "BatchSettlementPorts",
++    "BatchSettlementService",
++    "BatchTotals",
+     "BlockedCaller",
+     "Claimed",
+     "DecisionProvider",
+@@ -45,19 +60,24 @@ __all__ = [
+     "InvalidKey",
+     "KeyReused",
+     "Replay",
++    "SettlementReport",
+     "StillInFlight",
+-    "UnknownDecisionProviderError",
+     "UnknownCaller",
++    "UnknownDecisionProviderError",
+     "aresponses_via_chat_completions",
++    "backoff_delay",
+     "call_responses",
+     "close_decision_client",
+     "decision_body",
+     "keep_claim_alive",
+     "reported_charge",
+     "request_decision",
++    "resolve_batch_provider",
+     "resolve_decision_provider",
++    "run_batch_settlement_worker",
+     "run_idempotency_sweeper",
+     "serves_responses",
+     "strip_gateway_minted_items",
++    "summarize_batch_results",
+     "uses_chat_completions_bridge",
+ ]
+diff --git a/src/gateway/services/inference/_batch_settlement.py b/src/gateway/services/inference/_batch_settlement.py
+new file mode 100644
+index 00000000..a63b392e
+--- /dev/null
++++ b/src/gateway/services/inference/_batch_settlement.py
+@@ -0,0 +1,379 @@
++"""Background settlement of locally-recorded asynchronous batches.
++
++A recorded batch advances itself instead of waiting for a client to read its
++results: the worker claims a short polling lease (so two gateway replicas
++never poll the same batch together), fetches the provider batch, and either
++schedules a bounded-backoff retry, records a distinct charge-free local
++terminal, or bills a completed batch exactly once. Billing uses the same
++pricing rules and the same atomic results gate as the manual GET results
++path, so the two racing each other cannot double count. Provider batches with
++no local record are outside this mechanism and keep their request-time
++behavior.
++"""
++
++from __future__ import annotations
++
++import uuid
++from dataclasses import dataclass
++from datetime import timedelta
++from decimal import Decimal
++from typing import TYPE_CHECKING, Any, Protocol
++
++from any_llm import LLMProvider
++from any_llm.exceptions import BatchNotCompleteError
++
++from gateway.core.config import GatewayConfig
++from gateway.core.metered_pricing import calculate_token_cost, quantize_cost
++from gateway.core.unit_of_work import UnitOfWork
++from gateway.core.usage import cache_read_tokens_of
++from gateway.log_config import logger
++from gateway.models.inference import BatchLocalStatus, BatchRecord
++from gateway.models.pricing import ModelPricing
++from gateway.repositories.inference import InferenceRepositories
++from gateway.services.log_writer import LogWriter
++from gateway.services.provider_kwargs import get_provider_kwargs
++
++if TYPE_CHECKING:
++    from datetime import datetime
++
++# One usage-log endpoint identifier, shared with the manual results route.
++USAGE_ENDPOINT_RESULTS = "/v1/batches/results"
++
++# Provider terminal statuses that produce no result charges, mapped to the
++# distinct local terminal. "canceled" is the provider spelling; "cancelled"
++# tolerated for providers that use it.
++_PROVIDER_TERMINAL: dict[str, BatchLocalStatus] = {
++    "failed": BatchLocalStatus.FAILED,
++    "canceled": BatchLocalStatus.CANCELLED,
++    "cancelled": BatchLocalStatus.CANCELLED,
++    "expired": BatchLocalStatus.EXPIRED,
++}
++# Provider status that triggers results billing. Everything else nonterminal
++# (validating, in_progress, finalizing, cancelling) is retried with backoff.
++_PROVIDER_COMPLETED = "completed"
++
++# Bound on the exponent so the cap arithmetic cannot overflow on old rows.
++_BACKOFF_EXPONENT_CEILING = 12
++
++
++def backoff_delay(attempts_made: int, *, base_sec: float, cap_sec: float) -> float:
++    """Exponential delay before the next poll, bounded at ``cap_sec``.
++
++    ``attempts_made`` polls have already run; the first retry waits one base
++    interval and it doubles from there. A bound, not a retry count: a batch is
++    polled for as long as it stays in progress, never in a tight loop.
++    """
++    exponent = min(max(attempts_made, 0), _BACKOFF_EXPONENT_CEILING)
++    return min(cap_sec, base_sec * (2**exponent))
++
++
++@dataclass(frozen=True)
++class BatchTotals:
++    """Sums and per-line usage for a completed batch's results."""
++
++    model: str
++    prompt_tokens: int
++    completion_tokens: int
++    total_tokens: int
++    cache_read_tokens: int
++    lines: list[tuple[int, int, int]]
++
++
++def summarize_batch_results(result: Any) -> BatchTotals:
++    """Sum per-request token usage from batch results, keeping each line for pricing.
++
++    Mirrors the manual path: cached prompt tokens are read the OpenAI way from
++    ``prompt_tokens_details``, and pricing happens a line at a time even though
++    the row reports the batch totals.
++    """
++    model = "batch"
++    prompt_tokens = completion_tokens = total_tokens = cache_read_tokens = 0
++    lines: list[tuple[int, int, int]] = []
++    for item in result.results:
++        usage = item.result.usage if item.result is not None else None
++        if usage is None:
++            continue
++        line_prompt = usage.prompt_tokens or 0
++        line_completion = usage.completion_tokens or 0
++        line_cache_read = cache_read_tokens_of(usage)
++        prompt_tokens += line_prompt
++        completion_tokens += line_completion
++        cache_read_tokens += line_cache_read
++        total_tokens += usage.total_tokens or 0
++        lines.append((line_prompt, line_completion, line_cache_read))
++        if item.result is not None:
++            model = item.result.model
++    return BatchTotals(
++        model=model,
++        prompt_tokens=prompt_tokens,
++        completion_tokens=completion_tokens,
++        total_tokens=total_tokens,
++        cache_read_tokens=cache_read_tokens,
++        lines=lines,
++    )
++
++
++def resolve_batch_provider(
++    config: GatewayConfig,
++    provider: str,
++    *,
++    workspace_id: uuid.UUID | None,
++) -> tuple[LLMProvider, dict[str, Any]]:
++    """Resolve a batch's provider name into (implementation, call kwargs).
++
++    A configured instance resolves to its type with the instance credentials;
++    any other value is parsed as a provider and the kwargs fall back to the
++    organization overlay of ``workspace_id``, the batch's own stored origin, so
++    a lifecycle call reaches the same credential source the batch was created
++    with. Raises UnsupportedProviderError on an unparseable provider.
++    """
++    if provider in config.providers:
++        impl = LLMProvider(config.provider_instance_type(provider))
++        return impl, get_provider_kwargs(config, impl, instance=provider)
++    impl = LLMProvider.from_string(provider)
++    return impl, get_provider_kwargs(config, impl, workspace_id=workspace_id)
++
++
++class BatchSettlementPorts(Protocol):
++    """Session-bound operations the service needs from old-shape services, wired per tick."""
++
++    async def find_pricing(
++        self,
++        provider: str,
++        model: str,
++        organization_id: uuid.UUID | None,
++    ) -> ModelPricing | None: ...
++
++    # Folds the cost into the creator's spend through the single reconcile writer.
++    async def fold_spend(self, user_id: str, cost: Decimal) -> None: ...
++
++    # Workspace/org attribution fallbacks for records predating the workspace column.
++    async def workspace_for_key(self, api_key_id: str | None) -> uuid.UUID: ...
++
++    async def organization_for_workspace(
++        self,
++        workspace_id: uuid.UUID | None,
++    ) -> uuid.UUID | None: ...
++
++    # Whether the originating key was budget exempt; a missing key is enforced.
++    async def origin_key_exempt(self, api_key_id: str | None) -> bool: ...
++
++
++@dataclass(frozen=True)
++class SettlementReport:
++    """What one worker tick did, for logging and tests."""
++
++    claimed: int = 0
++    settled: int = 0
++    terminal: int = 0
++    deferred: int = 0
++    skipped: int = 0
++
++
++class BatchSettlementService:
++    """Advance due recorded batches, one claimed lease and one transactional step at a time."""
++
++    def __init__(
++        self,
++        uow: UnitOfWork,
++        repositories: InferenceRepositories,
++        ports: BatchSettlementPorts,
++        config: GatewayConfig,
++        log_writer: LogWriter,
++        *,
++        owner: str,
++    ) -> None:
++        self._uow = uow
++        self._repos = repositories
++        self._ports = ports
++        self._config = config
++        self._log_writer = log_writer
++        self._owner = owner
++
++    async def _now(self) -> datetime:
++        # A repository call needs an open block; this nests into an outer one
++        # when called mid-step and commits on its own otherwise.
++        async with self._uow:
++            return await self._repos.idempotency.get_database_time()
++
++    async def run_once(self, *, limit: int) -> SettlementReport:
++        """Advance up to ``limit`` due batches, isolating failures per batch."""
++        now = await self._now()
++        async with self._uow:
++            due = await self._repos.batch.list_due(now, limit=limit)
++        report = SettlementReport()
++        for record in due:
++            try:
++                outcome = await self._advance(record)
++            except Exception:
++                # An escaping error would only end this batch's processing this tick;
++                # the lease lapses on its own and the next tick reclaims the batch.
++                logger.warning("Unexpected error advancing batch '%s'", record.id, exc_info=True)
++                outcome = "skipped"
++            report = _bump(report, outcome)
++        return report
++
++    async def _advance(self, record: BatchRecord) -> str:
++        """Claim the lease, read the provider batch, and branch on its status."""
++        token = str(uuid.uuid4())
++        now = await self._now()
++        lease_end = now + timedelta(seconds=self._config.batch_settlement_lease_sec)
++        async with self._uow:
++            claimed = await self._repos.batch.claim_lease(
++                record.id,
++                owner=self._owner,
++                token=token,
++                now=now,
++                lease_end=lease_end,
++            )
++        if not claimed:
++            # Another replica claimed it between the read and the claim.
++            return "skipped"
++
++        try:
++            provider_enum, kwargs = resolve_batch_provider(
++                self._config,
++                record.provider,
++                workspace_id=record.workspace_id,
++            )
++            batch = await self._retrieve(provider_enum, record.id, kwargs)
++            status = str(batch.status)
++            terminal = _PROVIDER_TERMINAL.get(status)
++            if terminal is not None:
++                async with self._uow:
++                    await self._repos.batch.finish_terminal(record.id, token=token, status=terminal)
++                logger.info("Batch '%s' reached local terminal '%s'", record.id, terminal)
++                return "terminal"
++            if status != _PROVIDER_COMPLETED:
++                await self._defer(record, token, f"provider status '{status}'")
++                return "deferred"
++            return await self._settle_completed(record, token, provider_enum, kwargs)
++        except BatchNotCompleteError as exc:
++            await self._defer(record, token, f"results not complete (status: {exc.batch_status})")
++            return "deferred"
++        except Exception as exc:
++            # Provider 429/5xx or any temporary failure: do not settle, retry later.
++            try:
++                await self._defer(record, token, str(exc))
++            except Exception:
++                # Even the schedule write failed; the lease lapses and another tick reclaims.
++                logger.warning(
++                    "Could not defer batch '%s' after a failure; its lease will lapse",
++                    record.id,
++                    exc_info=True,
++                )
++            return "deferred"
++
++    async def _retrieve(
++        self,
++        provider_enum: LLMProvider,
++        batch_id: str,
++        kwargs: dict[str, Any],
++    ) -> Any:
++        from any_llm.api import aretrieve_batch
++
++        return await aretrieve_batch(provider=provider_enum, batch_id=batch_id, **kwargs)
++
++    async def _defer(self, record: BatchRecord, token: str, error: str) -> None:
++        """Schedule the bounded-backoff retry and hold the lease until due."""
++        attempts = record.attempt_count + 1
++        delay = backoff_delay(
++            record.attempt_count,
++            base_sec=self._config.batch_settlement_backoff_base_sec,
++            cap_sec=self._config.batch_settlement_backoff_cap_sec,
++        )
++        next_poll_at = await self._now() + timedelta(seconds=delay)
++        async with self._uow:
++            moved = await self._repos.batch.defer(
++                record.id,
++                token=token,
++                attempt=attempts,
++                next_poll_at=next_poll_at,
++                error=error,
++            )
++        if not moved:
++            logger.info("Batch '%s' lease was taken over; skipping its deferral", record.id)
++
++    async def _settle_completed(
++        self,
++        record: BatchRecord,
++        token: str,
++        provider_enum: LLMProvider,
++        kwargs: dict[str, Any],
++    ) -> str:
++        """Fetch and price results, then claim the gate and bill exactly once."""
++        from any_llm.api import aretrieve_batch_results
++
++        result = await aretrieve_batch_results(provider=provider_enum, batch_id=record.id, **kwargs)
++        totals = summarize_batch_results(result)
++
++        # Attribution follows the creator: stored workspace when present,
++        # otherwise the originating key's workspace, priced at that org's rates.
++        workspace_id = record.workspace_id or await self._ports.workspace_for_key(record.api_key_id)
++        organization_id = await self._ports.organization_for_workspace(workspace_id)
++        exempt = await self._ports.origin_key_exempt(record.api_key_id)
++
++        cost: Decimal | None = None
++        if totals.total_tokens:
++            pricing = await self._ports.find_pricing(provider_enum.value, totals.model, organization_id)
++            if pricing is not None:
++                cost = quantize_cost(
++                    sum(
++                        (
++                            calculate_token_cost(
++                                pricing,
++                                input_tokens=line_prompt,
++                                output_tokens=line_completion,
++                                cache_read_tokens=line_cache_read,
++                                cache_tokens_included=True,
++                                quantize=False,
++                            )
++                            for line_prompt, line_completion, line_cache_read in totals.lines
++                        ),
++                        Decimal(0),
++                    )
++                )
++
++        # Billable tokens with no price row: leave the gate unclaimed and retry,
++        # exactly like the manual path, so pricing appearing later still bills once.
++        if totals.total_tokens and cost is None and not exempt:
++            await self._defer(record, token, "pricing not configured")
++            return "deferred"
++
++        now = await self._now()
++        async with self._uow:
++            won = await self._repos.batch.claim_results(record.id, now=now)
++            if won:
++                usage_log = self._repos.batch.build_results_usage_log(
++                    record=record,
++                    model=totals.model,
++                    workspace_id=workspace_id,
++                    prompt_tokens=totals.prompt_tokens,
++                    completion_tokens=totals.completion_tokens,
++                    total_tokens=totals.total_tokens,
++                    cache_read_tokens=totals.cache_read_tokens,
++                    cost=cost,
++                    counts_toward_budget=not exempt,
++                    now=now,
++                )
++                await self._log_writer.put(usage_log)
++            # Release the lease and mark settled in the same transaction as the
++            # claim whether this worker won the gate or a concurrent retrieval did.
++            await self._repos.batch.settle(record.id, token=token)
++            if won and cost and not exempt:
++                # Commits claim, local state and the spend fold atomically.
++                await self._ports.fold_spend(record.user_id, cost)
++        if won:
++            logger.info(
++                "Settled batch '%s': %d tokens, cost %s",
++                record.id,
++                totals.total_tokens,
++                cost,
++            )
++        return "settled"
++
++
++def _bump(report: SettlementReport, outcome: str) -> SettlementReport:
++    """Add one to the report field named by ``outcome``."""
++    values = {**report.__dict__, outcome: getattr(report, outcome) + 1}
++    return SettlementReport(**values)
+diff --git a/src/gateway/services/inference/_batch_worker.py b/src/gateway/services/inference/_batch_worker.py
+new file mode 100644
+index 00000000..2e6d9d92
+--- /dev/null
++++ b/src/gateway/services/inference/_batch_worker.py
+@@ -0,0 +1,30 @@
++"""The periodic loop that drives background batch settlement until shutdown."""
++
++from __future__ import annotations
++
++import asyncio
++from collections.abc import Awaitable, Callable
++
++from gateway.log_config import logger
++
++
++async def run_batch_settlement_worker(
++    interval: float,
++    tick: Callable[[], Awaitable[None]],
++) -> None:
++    """Run one settlement tick every ``interval``; failures are retried on the next tick.
++
++    Each tick opens its own Unit of Work inside ``tick`` (wired by the caller),
++    so a failing tick never leaves a transaction open. The fixed sleep, plus the
++    per-batch backoff written by the service, means a provider outage or missing
++    price causes waiting rather than a busy loop.
++    """
++    while True:
++        await asyncio.sleep(interval)
++        try:
++            await tick()
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            # An escaping error would end this worker, and nothing restarts it.
++            logger.warning("Batch settlement tick failed; retrying in %ss", interval, exc_info=True)
+diff --git a/tests/integration/test_batch_settlement_worker.py b/tests/integration/test_batch_settlement_worker.py
+new file mode 100644
+index 00000000..e6a6cb5e
+--- /dev/null
++++ b/tests/integration/test_batch_settlement_worker.py
+@@ -0,0 +1,523 @@
++"""Integration tests for background settlement of locally-recorded batches."""
++
++from collections.abc import Generator
++from contextlib import contextmanager
++from typing import Any
++from unittest.mock import AsyncMock, patch
++
++import pytest
++from any_llm.types.batch import BatchResult, BatchResultItem
++from any_llm.types.completion import CompletionUsage
++from fastapi.testclient import TestClient
++from sqlalchemy import create_engine, text
++
++from gateway.core.config import API_KEY_HEADER, API_ROOT
++
++
++@contextmanager
++def _patch_provider(*, retrieve: AsyncMock, results: AsyncMock) -> Generator[None]:
++    """Patch the provider functions in both the route's and the SDK's namespace.
++
++    The route binds the names at import, so patching ``any_llm.api`` only would
++    not redirect manual calls; one shared mock keeps a side_effect sequence
++    coherent across tick and route.
++    """
++    with (
++        patch("gateway.api.routes.batches.aretrieve_batch", retrieve),
++        patch("gateway.api.routes.batches.aretrieve_batch_results", results),
++        patch("any_llm.api.aretrieve_batch", retrieve),
++        patch("any_llm.api.aretrieve_batch_results", results),
++    ):
++        yield
++
++
++async def _run_tick(app: Any, owner: str = "test-worker") -> Any:
++    """Run one production-shaped settlement tick on the app's event loop."""
++    from gateway.api.deps import build_batch_settlement_service
++    from gateway.core.unit_of_work import create_worker_unit_of_work
++
++    async with create_worker_unit_of_work() as (uow, db):
++        service = build_batch_settlement_service(
++            uow,
++            db,
++            app.state.config,
++            app.state.log_writer,
++            owner=owner,
++        )
++        return await service.run_once(limit=10)
++
++
++def _tick(client: TestClient, owner: str = "test-worker") -> Any:
++    return client.portal.call(_run_tick, client.app, owner)
++
++
++def _local_status(postgres_url: str, batch_id: str) -> str:
++    engine = create_engine(postgres_url)
++    try:
++        with engine.connect() as conn:
++            value = conn.execute(
++                text("SELECT local_status FROM batches WHERE id = :id"),
++                {"id": batch_id},
++            ).scalar_one()
++    finally:
++        engine.dispose()
++    return str(value)
++
++
++@pytest.fixture
++def _zero_backoff() -> Generator[None]:
++    # Retries are due immediately so a test can advance a batch tick to tick.
++    with patch(
++        "gateway.services.inference._batch_settlement.backoff_delay",
++        return_value=0.0,
++    ):
++        yield
++
++
++def _results(tokens: CompletionUsage | None = None) -> BatchResult:
++    payload: dict[str, Any] = {
++        "id": "chatcmpl-1",
++        "created": 1,
++        "model": "gpt-4o-mini",
++        "object": "chat.completion",
++        "choices": [
++            {
++                "index": 0,
++                "finish_reason": "stop",
++                "message": {"role": "assistant", "content": "42"},
++            }
++        ],
++    }
++    if tokens is not None:
++        payload["usage"] = tokens.model_dump()
++    from any_llm.types.completion import ChatCompletion
++
++    completion = ChatCompletion.model_validate(payload)
++    return BatchResult(results=[BatchResultItem(custom_id="req-1", result=completion, error=None)])
++
++
++def _create_batch(client: TestClient, header: dict[str, str], batch_id: str = "batch_bg") -> str:
++    from .test_batches_endpoint import _create_batch_body, _mock_batch
++
++    class _SupportsBatch:
++        SUPPORTS_BATCH = True
++
++    with (
++        patch(
++            "gateway.api.routes.batches.acreate_batch",
++            new_callable=AsyncMock,
++            return_value=_mock_batch(id=batch_id),
++        ),
++        patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
++    ):
++        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=header)
++    assert resp.status_code == 200
++    return str(resp.json()["id"])
++
++
++class TestBackgroundSettlement:
++    def test_completed_batch_is_billed_without_a_results_read(
++        self,
++        client: TestClient,
++        api_key_header: dict[str, str],
++        master_key_header: dict[str, str],
++        api_key_obj: dict[str, Any],
++        postgres_url: str,
++        _zero_backoff: None,
++    ) -> None:
++        """The whole point: no client reads results, yet usage and spend land."""
++        from .test_batches_endpoint import _mock_batch
++
++        # Pricing exists so the completed batch bills on the second tick.
++        pricing = client.post(
++            f"{API_ROOT}/pricing",
++            json={
++                "model_key": "openai:gpt-4o-mini",
++                "input_price_per_million": 1.0,
++                "output_price_per_million": 2.0,
++            },
++            headers=master_key_header,
++        )
++        assert pricing.status_code == 200
++
++        batch_id = _create_batch(client, api_key_header)
++        tokens = CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
++
++        retrieve = AsyncMock(
++            side_effect=[
++                _mock_batch(id=batch_id, status="in_progress"),
++                _mock_batch(id=batch_id, status="completed"),
++            ]
++        )
++        results = AsyncMock(return_value=_results(tokens))
++        with (
++            patch("any_llm.api.aretrieve_batch", retrieve),
++            patch("any_llm.api.aretrieve_batch_results", results),
++        ):
++            first = _tick(client)
++            # Still in flight: deferred, not billed.
++            assert first.deferred == 1
++            usage_before = client.get(
++                f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header
++            ).json()
++            assert [row for row in usage_before if row["endpoint"] == "/v1/batches/results"] == []
++
++            second = _tick(client)
++            assert second.settled == 1
++
++        assert _local_status(postgres_url, batch_id) == "settled"
++
++        rows = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header).json()
++        results_rows = [row for row in rows if row["endpoint"] == "/v1/batches/results"]
++        assert len(results_rows) == 1
++        assert results_rows[0]["total_tokens"] == 150
++        expected_cost = 100 / 1_000_000 + 100 / 1_000_000
++        assert results_rows[0]["cost"] == pytest.approx(expected_cost)
++
++        user = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}", headers=master_key_header).json()
++        assert user["spend"] == pytest.approx(expected_cost)
++
++    @pytest.mark.parametrize(
++        ("provider_status", "local_status"),
++        [
++            ("failed", "failed"),
++            ("cancelled", "cancelled"),
++            ("expired", "expired"),
++        ],
++    )
++    def test_terminal_batches_get_a_local_terminal_and_no_charges(
++        self,
++        client: TestClient,
++        api_key_header: dict[str, str],
++        master_key_header: dict[str, str],
++        api_key_obj: dict[str, Any],
++        postgres_url: str,
++        provider_status: str,
++        local_status: str,
++    ) -> None:
++        from .test_batches_endpoint import _mock_batch
++
++        batch_id = _create_batch(client, api_key_header, batch_id=f"batch_{provider_status}")
++        results_fetch = AsyncMock()
++        with (
++            patch(
++                "any_llm.api.aretrieve_batch",
++                AsyncMock(return_value=_mock_batch(id=batch_id, status=provider_status)),
++            ),
++            patch("any_llm.api.aretrieve_batch_results", results_fetch),
++        ):
++            report = _tick(client)
++
++        assert report.terminal == 1
++        results_fetch.assert_not_awaited()
++        assert _local_status(postgres_url, batch_id) == local_status
++
++        rows = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header).json()
++        assert [row for row in rows if row["endpoint"] == "/v1/batches/results"] == []
++        user = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}", headers=master_key_header).json()
++        assert user["spend"] == pytest.approx(0.0)
++
++    def test_tick_after_manual_results_settle_does_not_bill_again(
++        self,
++        client: TestClient,
++        api_key_header: dict[str, str],
++        master_key_header: dict[str, str],
++        api_key_obj: dict[str, Any],
++        _zero_backoff: None,
++    ) -> None:
++        """Manual GET results wins the gate; the later tick only observes it."""
++        from .test_batches_endpoint import _mock_batch
++
++        client.post(
++            f"{API_ROOT}/pricing",
++            json={
++                "model_key": "openai:gpt-4o-mini",
++                "input_price_per_million": 1.0,
++                "output_price_per_million": 2.0,
++            },
++            headers=master_key_header,
++        )
++        batch_id = _create_batch(client, api_key_header)
++        tokens = CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
++
++        retrieve = AsyncMock(return_value=_mock_batch(id=batch_id, status="completed"))
++        results = AsyncMock(return_value=_results(tokens))
++        with _patch_provider(retrieve=retrieve, results=results):
++            manual = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
++            assert manual.status_code == 200
++            report = _tick(client)
++
++        # Already settled by the manual read: not due, nothing billed twice.
++        assert report.settled == 0
++        rows = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header).json()
++        results_rows = [row for row in rows if row["endpoint"] == "/v1/batches/results"]
++        assert len(results_rows) == 1
++        user = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}", headers=master_key_header).json()
++        assert user["spend"] == pytest.approx(100 / 1_000_000 + 100 / 1_000_000)
++
++    def test_manual_results_after_tick_does_not_bill_again(
++        self,
++        client: TestClient,
++        api_key_header: dict[str, str],
++        master_key_header: dict[str, str],
++        api_key_obj: dict[str, Any],
++        _zero_backoff: None,
++    ) -> None:
++        """The tick wins the gate; the later manual read returns results without billing."""
++        from .test_batches_endpoint import _mock_batch
++
++        client.post(
++            f"{API_ROOT}/pricing",
++            json={
++                "model_key": "openai:gpt-4o-mini",
++                "input_price_per_million": 1.0,
++                "output_price_per_million": 2.0,
++            },
++            headers=master_key_header,
++        )
++        batch_id = _create_batch(client, api_key_header)
++        tokens = CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
++
++        retrieve = AsyncMock(return_value=_mock_batch(id=batch_id, status="completed"))
++        results = AsyncMock(return_value=_results(tokens))
++        with _patch_provider(retrieve=retrieve, results=results):
++            report = _tick(client)
++            assert report.settled == 1
++            manual = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
++            assert manual.status_code == 200
++
++        rows = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header).json()
++        results_rows = [row for row in rows if row["endpoint"] == "/v1/batches/results"]
++        assert len(results_rows) == 1
++        user = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}", headers=master_key_header).json()
++        assert user["spend"] == pytest.approx(100 / 1_000_000 + 100 / 1_000_000)
++
++    def test_concurrent_tick_and_results_bill_exactly_once(
++        self,
++        client: TestClient,
++        api_key_header: dict[str, str],
++        master_key_header: dict[str, str],
++        api_key_obj: dict[str, Any],
++        _zero_backoff: None,
++    ) -> None:
++        """The atomic results gate is the single billing point under real concurrency."""
++        import threading
++
++        from .test_batches_endpoint import _mock_batch
++
++        client.post(
++            f"{API_ROOT}/pricing",
++            json={
++                "model_key": "openai:gpt-4o-mini",
++                "input_price_per_million": 1.0,
++                "output_price_per_million": 2.0,
++            },
++            headers=master_key_header,
++        )
++        batch_id = _create_batch(client, api_key_header)
++        tokens = CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
++
++        errors: list[BaseException] = []
++
++        def _read_results() -> None:
++            try:
++                resp = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
++                assert resp.status_code == 200
++            except BaseException as exc:  # pragma: no cover - test diagnostics
++                errors.append(exc)
++
++        retrieve = AsyncMock(return_value=_mock_batch(id=batch_id, status="completed"))
++        results = AsyncMock(return_value=_results(tokens))
++        with _patch_provider(retrieve=retrieve, results=results):
++            threads = [threading.Thread(target=_read_results) for _ in range(4)]
++            for thread in threads:
++                thread.start()
++            report = _tick(client)
++            for thread in threads:
++                thread.join(timeout=10)
++
++        assert not errors
++        # A reader may have settled the batch before the tick, or the tick won:
++        # either way only one bill exists, asserted below.
++        assert report.settled in {0, 1}
++        rows = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header).json()
++        results_rows = [row for row in rows if row["endpoint"] == "/v1/batches/results"]
++        assert len(results_rows) == 1
++        user = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}", headers=master_key_header).json()
++        assert user["spend"] == pytest.approx(100 / 1_000_000 + 100 / 1_000_000)
++
++    def test_legacy_batches_with_no_record_are_not_scanned(
++        self,
++        client: TestClient,
++    ) -> None:
++        """No local record means the worker never asks the provider about the batch."""
++        retrieve = AsyncMock()
++        with patch("any_llm.api.aretrieve_batch", retrieve):
++            report = _tick(client)
++
++        assert report.settled == 0
++        assert report.terminal == 0
++        assert report.deferred == 0
++        retrieve.assert_not_awaited()
++
++    def test_lapsed_lease_is_taken_over_by_another_owner_and_billed(
++        self,
++        client: TestClient,
++        api_key_header: dict[str, str],
++        master_key_header: dict[str, str],
++        api_key_obj: dict[str, Any],
++        postgres_url: str,
++    ) -> None:
++        """After a worker stalls past its lease, a different replica claims and settles."""
++        from .test_batches_endpoint import _mock_batch
++
++        client.post(
++            f"{API_ROOT}/pricing",
++            json={
++                "model_key": "openai:gpt-4o-mini",
++                "input_price_per_million": 1.0,
++                "output_price_per_million": 2.0,
++            },
++            headers=master_key_header,
++        )
++        batch_id = _create_batch(client, api_key_header, batch_id="batch_lease")
++        tokens = CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
++
++        # First tick: the provider call fails, so the batch is deferred with the
++        # lease held until its next poll and the error recorded.
++        retrieve = AsyncMock(
++            side_effect=[
++                RuntimeError("502 upstream"),
++                _mock_batch(id=batch_id, status="completed"),
++            ]
++        )
++        results = AsyncMock(return_value=_results(tokens))
++        with (
++            patch("any_llm.api.aretrieve_batch", retrieve),
++            patch("any_llm.api.aretrieve_batch_results", results),
++        ):
++            first = _tick(client, owner="worker-1")
++            assert first.deferred == 1
++
++        # Simulate reaching the scheduled retry time after the lease lapsed and
++        # worker-1 is gone (process restart): another owner may claim it.
++        engine = create_engine(postgres_url)
++        try:
++            with engine.begin() as conn:
++                conn.execute(
++                    text(
++                        "UPDATE batches SET leased_until = NOW() - INTERVAL '1 second', "
++                        "next_poll_at = NOW() - INTERVAL '1 second' WHERE id = :id"
++                    ),
++                    {"id": batch_id},
++                )
++        finally:
++            engine.dispose()
++
++        with (
++            patch("any_llm.api.aretrieve_batch", retrieve),
++            patch("any_llm.api.aretrieve_batch_results", results),
++        ):
++            second = _tick(client, owner="worker-2")
++
++        assert second.settled == 1
++        assert _local_status(postgres_url, batch_id) == "settled"
++        rows = client.get(
++            f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header
++        ).json()
++        results_rows = [row for row in rows if row["endpoint"] == "/v1/batches/results"]
++        assert len(results_rows) == 1
++        user = client.get(
++            f"{API_ROOT}/users/{api_key_obj['user_id']}", headers=master_key_header
++        ).json()
++        assert user["spend"] == pytest.approx(100 / 1_000_000 + 100 / 1_000_000)
++
++
++class TestEndToEndWorker:
++    def test_short_interval_worker_bills_without_a_results_read(
++        self,
++        postgres_url: str,
++        master_key_header: dict[str, str],
++        clean_database: None,
++    ) -> None:
++        from gateway.core.config import GatewayConfig
++
++        from .conftest import build_test_client
++        from .test_batches_endpoint import _create_batch_body, _mock_batch
++
++        config = GatewayConfig(
++            database_url=postgres_url,
++            master_key="test-master-key",
++            host="127.0.0.1",
++            port=8000,
++            auto_migrate=False,
++            require_pricing=False,
++            batch_settlement_enabled=True,
++            batch_settlement_interval_sec=1,
++        )
++
++        class _SupportsBatch:
++            SUPPORTS_BATCH = True
++
++        @contextmanager
++        def _client() -> Generator[TestClient]:
++            yield from build_test_client(config)
++
++        with _client() as client:
++            # A user the master-key batch bills, plus the price row.
++            user_resp = client.post(
++                f"{API_ROOT}/users",
++                json={"user_id": "batch-e2e-user"},
++                headers=master_key_header,
++            )
++            assert user_resp.status_code == 200
++
++            pricing = client.post(
++                f"{API_ROOT}/pricing",
++                json={
++                    "model_key": "openai:gpt-4o-mini",
++                    "input_price_per_million": 1.0,
++                    "output_price_per_million": 2.0,
++                },
++                headers=master_key_header,
++            )
++            assert pricing.status_code == 200
++
++            tokens = CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
++            retrieve = AsyncMock(return_value=_mock_batch(id="batch_e2e", status="completed"))
++            results = AsyncMock(return_value=_results(tokens))
++            # Provider calls patched before the batch exists, so no 1s tick can
++            # hit an unmocked provider and push the batch onto a long backoff.
++            with _patch_provider(retrieve=retrieve, results=results):
++                with (
++                    patch(
++                        "gateway.api.routes.batches.acreate_batch",
++                        new_callable=AsyncMock,
++                        return_value=_mock_batch(id="batch_e2e"),
++                    ),
++                    patch(
++                        "gateway.api.routes.batches.AnyLLM.get_provider_class",
++                        return_value=_SupportsBatch,
++                    ),
++                ):
++                    created = client.post(
++                        f"{API_ROOT}/batches",
++                        json=_create_batch_body(user="batch-e2e-user"),
++                        headers={API_KEY_HEADER: "Bearer test-master-key"},
++                    )
++                    assert created.status_code == 200
++
++                # The 1s worker settles it on its own; poll for the spend.
++                import time
++
++                deadline = time.monotonic() + 20
++                spend = 0.0
++                while time.monotonic() < deadline:
++                    user = client.get(f"{API_ROOT}/users/batch-e2e-user", headers=master_key_header)
++                    if user.status_code == 200:
++                        spend = float(user.json()["spend"])
++                        if spend > 0:
++                            break
++                    time.sleep(0.5)
++
++            assert spend == pytest.approx(100 / 1_000_000 + 100 / 1_000_000)
+diff --git a/tests/unit/test_batch_settlement.py b/tests/unit/test_batch_settlement.py
+new file mode 100644
+index 00000000..74df91fe
+--- /dev/null
++++ b/tests/unit/test_batch_settlement.py
+@@ -0,0 +1,464 @@
++"""Unit tests for background batch settlement: backoff, summaries and the service state machine."""
++
++from __future__ import annotations
++
++import uuid
++from datetime import UTC, datetime, timedelta
++from decimal import Decimal
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.models.inference import BatchLocalStatus
++from gateway.services.inference import (
++    BatchSettlementService,
++    backoff_delay,
++    summarize_batch_results,
++)
++from gateway.services.inference._batch_settlement import (
++    _PROVIDER_COMPLETED,
++    _PROVIDER_TERMINAL,
++)
++
++
++class TestBackoff:
++    def test_first_retry_is_one_base(self) -> None:
++        assert backoff_delay(0, base_sec=10, cap_sec=1800) == 10
++
++    def test_doubles_each_retry(self) -> None:
++        assert backoff_delay(2, base_sec=10, cap_sec=1800) == 40
++
++    def test_is_bounded(self) -> None:
++        assert backoff_delay(100, base_sec=10, cap_sec=300) == 300
++
++    def test_negative_attempts_treated_as_zero(self) -> None:
++        assert backoff_delay(-3, base_sec=10, cap_sec=1800) == 10
++
++
++class TestProviderStatusMap:
++    def test_terminals_map_to_distinct_local_states(self) -> None:
++        assert _PROVIDER_TERMINAL["failed"] == BatchLocalStatus.FAILED
++        assert _PROVIDER_TERMINAL["canceled"] == BatchLocalStatus.CANCELLED
++        assert _PROVIDER_TERMINAL["cancelled"] == BatchLocalStatus.CANCELLED
++        assert _PROVIDER_TERMINAL["expired"] == BatchLocalStatus.EXPIRED
++
++    def test_completed_is_not_in_the_terminal_map(self) -> None:
++        # A completed batch is billable, not a charge-free terminal.
++        assert _PROVIDER_COMPLETED not in _PROVIDER_TERMINAL
++
++
++class TestSummarizeBatchResults:
++    def _result(self, *, prompt: int, completion: int, total: int, cached: int = 0) -> SimpleNamespace:
++        usage = SimpleNamespace(
++            prompt_tokens=prompt,
++            completion_tokens=completion,
++            total_tokens=total,
++            prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
++        )
++        return SimpleNamespace(model="gpt-4o-mini", usage=usage)
++
++    def _batch_result(self, items: list[SimpleNamespace | None]) -> SimpleNamespace:
++        wrapped = [SimpleNamespace(result=item) for item in items]
++        return SimpleNamespace(results=wrapped)
++
++    def test_sums_tokens_and_keeps_lines(self) -> None:
++        batch = self._batch_result(
++            [self._result(prompt=100, completion=50, total=150), self._result(prompt=20, completion=5, total=25)]
++        )
++        totals = summarize_batch_results(batch)
++        assert totals.prompt_tokens == 120
++        assert totals.completion_tokens == 55
++        assert totals.total_tokens == 175
++        assert totals.lines == [(100, 50, 0), (20, 5, 0)]
++        assert totals.model == "gpt-4o-mini"
++
++    def test_carries_cached_tokens(self) -> None:
++        batch = self._batch_result([self._result(prompt=100, completion=5, total=105, cached=80)])
++        totals = summarize_batch_results(batch)
++        assert totals.cache_read_tokens == 80
++        assert totals.lines == [(100, 5, 80)]
++
++    def test_items_without_result_or_usage_are_ignored(self) -> None:
++        batch = self._batch_result([None, SimpleNamespace(model=None, usage=None)])
++        totals = summarize_batch_results(batch)
++        assert totals.total_tokens == 0
++        assert totals.lines == []
++        assert totals.model == "batch"
++
++
++# ---------------------------------------------------------------------------
++# Service state machine
++# ---------------------------------------------------------------------------
++
++_NOW = datetime(2026, 10, 10, 12, tzinfo=UTC)
++
++
++class _FakeUow:
++    """No-op async context manager: the fake repositories record the writes."""
++
++    async def __aenter__(self) -> _FakeUow:
++        return self
++
++    async def __aexit__(self, *args: object) -> bool:
++        return False
++
++
++class _FakeBatchRepo:
++    def __init__(self, *, lease_claim_wins: bool = True) -> None:
++        self.lease_claim_wins = lease_claim_wins
++        self.claimed: list[dict[str, object]] = []
++        self.deferred: list[dict[str, object]] = []
++        self.terminals: list[BatchLocalStatus] = []
++        self.settled: list[str] = []
++        self.results_gate_claims = 0
++
++    async def list_due(self, now: datetime, *, limit: int) -> list[SimpleNamespace]:
++        return list(self._due)
++
++    async def claim_lease(self, batch_id: str, **kwargs: object) -> bool:
++        if not self.lease_claim_wins:
++            return False
++        self.claimed.append({"batch_id": batch_id, **kwargs})
++        return True
++
++    async def claim_results(self, batch_id: str, *, now: datetime) -> bool:
++        self.results_gate_claims += 1
++        return not self._gate_lost
++
++    async def defer(self, batch_id: str, **kwargs: object) -> bool:
++        self.deferred.append({"batch_id": batch_id, **kwargs})
++        return True
++
++    async def finish_terminal(self, batch_id: str, *, token: str, status: BatchLocalStatus) -> bool:
++        self.terminals.append(status)
++        return True
++
++    async def settle(self, batch_id: str, *, token: str) -> bool:
++        self.settled.append(batch_id)
++        return True
++
++    def build_results_usage_log(self, **kwargs: object) -> SimpleNamespace:
++        return SimpleNamespace(**kwargs)
++
++
++def _record(batch_id: str = "b1", *, attempt: int = 0) -> SimpleNamespace:
++    return SimpleNamespace(
++        id=batch_id,
++        provider="openai",
++        workspace_id=None,
++        attempt_count=attempt,
++        api_key_id="k1",
++        user_id="u1",
++    )
++
++
++def _build_service(
++    batch_repo: _FakeBatchRepo,
++    *,
++    records: list[SimpleNamespace],
++    ports: SimpleNamespace,
++    monkeypatch: pytest.MonkeyPatch,
++    provider_batch: SimpleNamespace | None = None,
++) -> BatchSettlementService:
++    batch_repo._due = records  # type: ignore[attr-defined]
++    batch_repo._gate_lost = False  # type: ignore[attr-defined]
++    uow = _FakeUow()
++    time_repo = SimpleNamespace(get_database_time=AsyncMock(return_value=_NOW))
++    repos = SimpleNamespace(idempotency=time_repo, batch=batch_repo)
++    log_writer = SimpleNamespace(put=AsyncMock())
++    config = SimpleNamespace(
++        batch_settlement_lease_sec=60,
++        batch_settlement_backoff_base_sec=10,
++        batch_settlement_backoff_cap_sec=1800,
++    )
++    service = BatchSettlementService(uow, repos, ports, config, log_writer, owner="worker-1")  # type: ignore[arg-type]
++
++    monkeypatch.setattr(
++        "gateway.services.inference._batch_settlement.resolve_batch_provider",
++        lambda *args, **kwargs: (SimpleNamespace(value="openai"), {}),
++    )
++    monkeypatch.setattr(
++        "any_llm.api.aretrieve_batch",
++        AsyncMock(return_value=provider_batch or SimpleNamespace(status="in_progress")),
++    )
++    return service
++
++
++def _ports(
++    *,
++    pricing: object | None = None,
++    workspace: uuid.UUID | None = None,
++    org: uuid.UUID | None = None,
++    exempt: bool = False,
++) -> tuple[SimpleNamespace, list[tuple[str, object]]]:
++    folds: list[tuple[str, object]] = []
++
++    async def fold_spend(user_id: str, cost: object) -> None:
++        folds.append((user_id, cost))
++
++    ports = SimpleNamespace(
++        find_pricing=AsyncMock(return_value=pricing),
++        fold_spend=fold_spend,
++        workspace_for_key=AsyncMock(return_value=workspace or uuid.UUID("00000000-0000-0000-0000-000000000001")),
++        organization_for_workspace=AsyncMock(return_value=org),
++        origin_key_exempt=AsyncMock(return_value=exempt),
++    )
++    return ports, folds
++
++
++class TestServiceAdvance:
++    @pytest.mark.asyncio
++    async def test_in_progress_provider_batch_is_deferred_with_backoff(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = _FakeBatchRepo()
++        ports, folds = _ports()
++        service = _build_service(repo, records=[_record()], ports=ports, monkeypatch=monkeypatch)
++
++        report = await service.run_once(limit=10)
++
++        assert report.deferred == 1
++        assert repo.deferred[0]["next_poll_at"] == _NOW + timedelta(seconds=10)
++        assert repo.deferred[0]["attempt"] == 1
++        assert repo.settled == []
++        assert folds == []
++
++    @pytest.mark.asyncio
++    async def test_completed_batch_is_billed_once_and_settled(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = _FakeBatchRepo()
++        pricing = SimpleNamespace()
++        ports, folds = _ports(pricing=pricing)
++        service = _build_service(
++            repo,
++            records=[_record()],
++            ports=ports,
++            monkeypatch=monkeypatch,
++            provider_batch=SimpleNamespace(status="completed"),
++        )
++        result_item = SimpleNamespace(
++            result=SimpleNamespace(
++                model="gpt-4o-mini",
++                usage=SimpleNamespace(
++                    prompt_tokens=100,
++                    completion_tokens=50,
++                    total_tokens=150,
++                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
++                ),
++            )
++        )
++        monkeypatch.setattr(
++            "any_llm.api.aretrieve_batch_results",
++            AsyncMock(return_value=SimpleNamespace(results=[result_item])),
++        )
++        # Price through the same cost core, with the arithmetic pinned for the test.
++        monkeypatch.setattr(
++            "gateway.services.inference._batch_settlement.calculate_token_cost",
++            lambda *args, **kwargs: Decimal("0.0002"),
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.settled == 1
++        assert repo.results_gate_claims == 1
++        assert repo.settled == ["b1"]
++        assert folds == [("u1", Decimal("0.0002"))]
++        ports.find_pricing.assert_awaited_once()
++        args = ports.find_pricing.await_args
++        assert args.args[:2] == ("openai", "gpt-4o-mini")
++
++    @pytest.mark.asyncio
++    async def test_completed_batch_without_pricing_defers_without_claiming_gate(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = _FakeBatchRepo()
++        ports, folds = _ports(pricing=None)
++        service = _build_service(
++            repo,
++            records=[_record()],
++            ports=ports,
++            monkeypatch=monkeypatch,
++            provider_batch=SimpleNamespace(status="completed"),
++        )
++        # Results carry billable tokens.
++        result_item = SimpleNamespace(
++            result=SimpleNamespace(
++                model="gpt-4o-mini",
++                usage=SimpleNamespace(
++                    prompt_tokens=100,
++                    completion_tokens=50,
++                    total_tokens=150,
++                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
++                ),
++            )
++        )
++        monkeypatch.setattr(
++            "any_llm.api.aretrieve_batch_results",
++            AsyncMock(return_value=SimpleNamespace(results=[result_item])),
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.deferred == 1
++        assert repo.results_gate_claims == 0
++        assert repo.settled == []
++        assert folds == []
++
++    @pytest.mark.asyncio
++    async def test_completed_batch_whose_gate_was_lost_is_settled_without_billing(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = _FakeBatchRepo()
++        pricing = SimpleNamespace()
++        ports, folds = _ports(pricing=pricing)
++        service = _build_service(
++            repo,
++            records=[_record()],
++            ports=ports,
++            monkeypatch=monkeypatch,
++            provider_batch=SimpleNamespace(status="completed"),
++        )
++        repo._gate_lost = True  # type: ignore[attr-defined]
++        monkeypatch.setattr(
++            "any_llm.api.aretrieve_batch_results",
++            AsyncMock(return_value=SimpleNamespace(results=[])),
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.settled == 1
++        assert repo.settled == ["b1"]
++        assert folds == []
++
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize(
++        ("provider_status", "local_status"),
++        [
++            ("failed", BatchLocalStatus.FAILED),
++            ("canceled", BatchLocalStatus.CANCELLED),
++            ("cancelled", BatchLocalStatus.CANCELLED),
++            ("expired", BatchLocalStatus.EXPIRED),
++        ],
++    )
++    async def test_terminal_provider_statuses_finish_without_billing(
++        self,
++        monkeypatch: pytest.MonkeyPatch,
++        provider_status: str,
++        local_status: BatchLocalStatus,
++    ) -> None:
++        repo = _FakeBatchRepo()
++        ports, folds = _ports()
++        service = _build_service(
++            repo,
++            records=[_record()],
++            ports=ports,
++            monkeypatch=monkeypatch,
++            provider_batch=SimpleNamespace(status=provider_status),
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.terminal == 1
++        assert repo.terminals == [local_status]
++        assert repo.results_gate_claims == 0
++        assert folds == []
++
++    @pytest.mark.asyncio
++    async def test_provider_failure_is_deferred_not_settled(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = _FakeBatchRepo()
++        ports, folds = _ports()
++        service = _build_service(repo, records=[_record()], ports=ports, monkeypatch=monkeypatch)
++        monkeypatch.setattr(
++            "any_llm.api.aretrieve_batch",
++            AsyncMock(side_effect=RuntimeError("502 from provider")),
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.deferred == 1
++        assert repo.settled == []
++        assert folds == []
++        assert "502 from provider" in str(repo.deferred[0]["error"])
++
++    @pytest.mark.asyncio
++    async def test_batch_not_complete_is_deferred(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        from any_llm.exceptions import BatchNotCompleteError
++
++        repo = _FakeBatchRepo()
++        ports, folds = _ports()
++        service = _build_service(
++            repo,
++            records=[_record()],
++            ports=ports,
++            monkeypatch=monkeypatch,
++            provider_batch=SimpleNamespace(status="completed"),
++        )
++        monkeypatch.setattr(
++            "any_llm.api.aretrieve_batch_results",
++            AsyncMock(side_effect=BatchNotCompleteError(batch_id="b1", status="completed")),
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.deferred == 1
++        assert repo.settled == []
++        assert folds == []
++
++    @pytest.mark.asyncio
++    async def test_failed_lease_claim_is_skipped_without_calling_provider(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        retrieve = AsyncMock()
++        monkeypatch.setattr("any_llm.api.aretrieve_batch", retrieve)
++        repo = _FakeBatchRepo(lease_claim_wins=False)
++        ports, _folds = _ports()
++        service = _build_service(repo, records=[_record()], ports=ports, monkeypatch=monkeypatch)
++
++        report = await service.run_once(limit=10)
++
++        assert report.skipped == 1
++        retrieve.assert_not_awaited()
++
++    @pytest.mark.asyncio
++    async def test_a_bad_record_does_not_stop_the_others(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = _FakeBatchRepo()
++        ports, _folds = _ports()
++        service = _build_service(
++            repo,
++            records=[_record("b1"), _record("b2")],
++            ports=ports,
++            monkeypatch=monkeypatch,
++        )
++
++        report = await service.run_once(limit=10)
++
++        assert report.deferred == 2
++        assert [d["batch_id"] for d in repo.deferred] == ["b1", "b2"]
++
++
++class TestBuildBatchSettlement:
++    def test_returns_none_when_disabled(self) -> None:
++        from gateway.main import _build_batch_settlement
++
++        config = SimpleNamespace(
++            batch_settlement_enabled=False,
++            batch_settlement_interval_sec=60,
++        )
++        assert _build_batch_settlement(config, AsyncMock()) is None  # type: ignore[arg-type]
++
++    def test_returns_none_for_nonpositive_interval(self) -> None:
++        from gateway.main import _build_batch_settlement
++
++        config = SimpleNamespace(
++            batch_settlement_enabled=True,
++            batch_settlement_interval_sec=0,
++        )
++        assert _build_batch_settlement(config, AsyncMock()) is None  # type: ignore[arg-type]

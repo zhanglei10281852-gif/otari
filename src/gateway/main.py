@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import importlib.util
+import uuid
 from collections.abc import AsyncGenerator, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ import any_fetch
 import any_search
 from gateway import features
 from gateway.api.deps import (
+    build_batch_settlement_service,
     build_file_service,
     build_idempotency_service,
     get_membership_listener,
@@ -38,6 +40,7 @@ from gateway.core.database import create_session, dispose_db, init_db
 from gateway.core.error_codes import error_code_of, error_headers
 from gateway.core.feature import Worker
 from gateway.core.settings.tools import warn_about_tool_instances
+from gateway.core.unit_of_work import create_worker_unit_of_work
 from gateway.dashboard import DASHBOARD_PACKAGE_PATH, get_dashboard_build_id, get_dashboard_dir
 from gateway.exceptions import TenancyError
 from gateway.exceptions.control_plane_exceptions import ControlPlaneError
@@ -58,7 +61,11 @@ from gateway.services.code_execution.container_sweeper import run_sandbox_contai
 from gateway.services.dashboard_session_service import revoke_sessions_on_master_key_change
 from gateway.services.feedback import new_feedback_rate_limiter
 from gateway.services.files import FileBackends, run_file_sweeper
-from gateway.services.inference import close_decision_client, run_idempotency_sweeper
+from gateway.services.inference import (
+    close_decision_client,
+    run_batch_settlement_worker,
+    run_idempotency_sweeper,
+)
 from gateway.services.log_writer import LogWriter, NoopLogWriter, create_log_writer
 from gateway.services.master_key_service import ensure_master_key
 from gateway.services.model_catalog_service import (
@@ -243,6 +250,29 @@ def _start_idempotency_sweeper(config: GatewayConfig, _container: Container) -> 
     return run_idempotency_sweeper(
         config.idempotency_sweep_interval_sec, lambda uow: build_idempotency_service(uow, config)
     )
+
+
+def _build_batch_settlement(
+    config: GatewayConfig,
+    log_writer: LogWriter,
+) -> Coroutine[Any, Any, None] | None:
+    """Return the background batch settlement loop, or None when it is disabled.
+
+    Separate from the worker registry because the loop needs the started
+    log writer (its usage row goes through that writer), which exists only once
+    the lifespan reaches this point. The owner id is this process's identity
+    for polling leases and stays constant for the process's lifetime.
+    """
+    if not config.batch_settlement_enabled or config.batch_settlement_interval_sec <= 0:
+        return None
+    owner = str(uuid.uuid4())
+
+    async def _tick() -> None:
+        async with create_worker_unit_of_work() as (uow, db):
+            service = build_batch_settlement_service(uow, db, config, log_writer, owner=owner)
+            await service.run_once(limit=config.batch_settlement_batch_size)
+
+    return run_batch_settlement_worker(config.batch_settlement_interval_sec, _tick)
 
 
 def _start_container_sweeper(config: GatewayConfig, _container: Container) -> Coroutine[Any, Any, None] | None:
@@ -644,6 +674,7 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
         log_writer: LogWriter
         workers: list[tuple[asyncio.Task[None], _LifespanWorker]] = []
         feature_workers: list[tuple[asyncio.Task[None], str]] = []
+        batch_settlement_worker: tuple[asyncio.Task[None], str] | None = None
         if config.is_hybrid_mode:
             log_writer = NoopLogWriter()
             # No stored search tools or tool settings to wait for on a hybrid gateway.
@@ -735,6 +766,15 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
                 if feature.worker is not None
             ]
 
+            # Started here rather than the worker registry because it needs the
+            # log writer built above; its task joins the same shutdown group.
+            batch_settlement = _build_batch_settlement(config, log_writer)
+            if batch_settlement is not None:
+                batch_settlement_worker = (
+                    asyncio.create_task(batch_settlement),
+                    "batch settlement worker",
+                )
+
         # Start the writer inside the try so a failure here still runs the cleanup
         # below; the refresher tasks are already created and would otherwise leak.
         log_writer_started = False
@@ -744,7 +784,10 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
             app.state.log_writer = log_writer
             yield
         finally:
-            await _stop_refreshers([(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers)
+            refreshers = [(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers
+            if batch_settlement_worker is not None:
+                refreshers.append(batch_settlement_worker)
+            await _stop_refreshers(refreshers)
             for _task, worker in workers:
                 if worker.reset is not None:
                     worker.reset()

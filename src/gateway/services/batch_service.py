@@ -15,7 +15,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from gateway.log_config import logger
-from gateway.models.inference import BatchRecord
+from gateway.models.inference import BatchLocalStatus, BatchRecord
 
 if TYPE_CHECKING:
     import uuid
@@ -100,3 +100,24 @@ async def claim_batch_accounting(db: AsyncSession, batch_id: str) -> bool:
     # getattr with a default: mypy sees .execute() as Result (no rowcount);
     # rowcount lives on CursorResult. Matches reserve_budget/_cas_reset_user_budget.
     return bool(getattr(result, "rowcount", 0))
+
+
+async def mark_batch_settled(db: AsyncSession, batch_id: str) -> None:
+    """Record the local settled state in the same transaction as a successful claim.
+
+    No commit: it is staged alongside the results gate and the spend fold so
+    the three stay atomic, and the batch stops looking due to the background
+    worker even where background settlement itself is disabled.
+    """
+    await db.execute(
+        update(BatchRecord)
+        .where(BatchRecord.id == batch_id, BatchRecord.local_status == BatchLocalStatus.IN_PROGRESS)
+        .values(
+            local_status=BatchLocalStatus.SETTLED,
+            lease_owner=None,
+            lease_token=None,
+            leased_until=None,
+            next_poll_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )

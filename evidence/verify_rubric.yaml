@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 已有本地记录的批次在客户端不读取 results 时也会被后台发现，completed 后按创建者作用域生成一次 usage 并折入一次 spend。
+  - id: 2
+    type: f2p
+    text: 多副本后台 worker、重复轮询和手动 results 请求并发结算同一批次时，token、cost、usage row 与 spend 都只记一次。
+  - id: 3
+    type: f2p
+    text: 提供方 429 或 5xx、数据库暂时失败及缺少价格都不会提前封死结算，采用有界退避后可重试并在恢复时完成原批次记账。
+  - id: 4
+    type: f2p
+    text: worker 中断或进程重启后，过期的处理权可由其他副本接管，并继续使用批次创建时的 workspace、组织价格与 provider credential 归属。
+  - id: 5
+    type: f2p
+    text: failed、cancelled 和 expired 等无结果终态停止轮询且不产生结果费用，本地可观察状态能与 completed 已结算区分。
+  - id: 6
+    type: p2p
+    text: 无本地 BatchRecord 的历史批次仍走现有按请求兼容路径，已有 retrieve、cancel、list、results 的权限和响应格式不变。
+  - id: 7
+    type: p2p
+    text: 后台结算关闭时维持现有行为，首次成功读取 completed results 仍能原子记账，重复读取不会重复收费。

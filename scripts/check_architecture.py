@@ -1507,7 +1507,7 @@ MODEL_ACCESS: dict[str, ModelAccess] = {
         "baseline": ("gateway/services/tenancy/organization_guardrail_service.py",),
     },
     "gateway.models.inference.BatchRecord": {
-        "repository": None,
+        "repository": "gateway/repositories/inference/batch_repository.py",
         "baseline": ("gateway/services/batch_service.py",),
     },
     "gateway.models.inference.IdempotencyRecord": {
@@ -1769,6 +1769,7 @@ MODEL_ACCESS: dict[str, ModelAccess] = {
             "gateway/api/routes/search.py",
             "gateway/api/routes/usage.py",
             "gateway/api/routes/users.py",
+            "gateway/repositories/inference/batch_repository.py",
             "gateway/repositories/users_repository.py",
             "gateway/services/external_usage_service.py",
             "gateway/services/tenancy/workspace_activation_service.py",

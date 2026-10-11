@@ -112,11 +112,26 @@ async def create_log_unit_of_work() -> AsyncIterator[UnitOfWork]:
         yield UnitOfWork(session)
 
 
+@asynccontextmanager
+async def create_worker_unit_of_work() -> AsyncIterator[tuple[UnitOfWork, AsyncSession]]:
+    """Yield a worker's Unit of Work and its session together.
+
+    For a worker job whose service wires old-shape helpers onto its session
+    (the spend fold and pricing lookup still take the session directly). The
+    session stays with the composition code that builds the service; the
+    service itself reaches the database through its repositories and never
+    names it.
+    """
+    async with create_session() as session:
+        yield UnitOfWork(session), session
+
+
 __all__ = [
     "OutsideUnitOfWorkError",
     "UnitOfWork",
     "UnitOfWorkRolledBackError",
     "create_log_unit_of_work",
     "create_unit_of_work",
+    "create_worker_unit_of_work",
     "session_for",
 ]

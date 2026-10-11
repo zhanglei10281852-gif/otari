@@ -90,6 +90,11 @@ the corresponding startup value after the database is available.
 | `rate_limit_redis_url` | The Redis that the `redis` store counts in. |
 | `rate_limits` | Requests per minute, tokens per minute and requests in flight, per deployment, API key, user or model. Also managed from the dashboard. See [Rate limit rules](#rate-limit-rules). |
 | `idempotency_retention_sec` | How long a completion sent with an `Idempotency-Key` is kept for a retry to replay. Defaults to a day; `0` ignores the header. Needs `OTARI_SECRET_KEY`, which encrypts the stored response. See [Retrying safely](api-reference.md#retrying-safely). |
+| `batch_settlement_enabled` | Advance and bill locally-recorded batches in the background, so a client never has to read results for usage and spend to land. Defaults to `true`; off keeps settlement on the first `GET` results as before. Not available in hybrid mode. |
+| `batch_settlement_interval_sec` | How often the background worker looks for batches due a poll. Defaults to a minute. |
+| `batch_settlement_batch_size` | How many due batches one worker tick advances. Defaults to 10. |
+| `batch_settlement_lease_sec` | How long one gateway holds a batch's polling lease; past this another replica may claim it if the worker stalled. Defaults to a minute. |
+| `batch_settlement_backoff_base_sec`, `batch_settlement_backoff_cap_sec` | Base wait before re-polling a still-running or temporarily obstructed batch (it doubles each retry) and the largest wait, defaulting to 10 seconds and 30 minutes. |
 | `enable_metrics` | Serve Prometheus metrics at `/metrics`. Needs the `metrics` extra (`pip install gateway[metrics]`), which the Docker image installs; setting this without it refuses to start. |
 | `accept_incoming_trace_context` | Join spans the gateway creates to the caller's trace. Defaults to `false`. See [Trace context propagation](#trace-context-propagation). |
 | `enable_docs` | Serve OpenAPI, Swagger UI, and ReDoc. |

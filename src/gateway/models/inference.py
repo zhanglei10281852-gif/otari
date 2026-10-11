@@ -10,6 +10,22 @@ from sqlalchemy.orm import Mapped, mapped_column
 from gateway.models.base import Base
 
 
+class BatchLocalStatus(StrEnum):
+    """The local lifecycle state of a recorded batch, independent of the provider's.
+
+    IN_PROGRESS batches are advanced by the background settlement worker under a
+    polling lease; SETTLED is a billed, completed batch; FAILED, CANCELLED and
+    EXPIRED are the distinct local terminals for provider batches that produced
+    no result charges and are never polled again.
+    """
+
+    IN_PROGRESS = "in_progress"
+    SETTLED = "settled"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
 class BatchRecord(Base):
     """Ownership and accounting record for an asynchronous batch job.
 
@@ -55,6 +71,25 @@ class BatchRecord(Base):
     # NULL until the first completed results retrieval accounts the batch; the
     # atomic NULL -> now transition is the idempotency gate for billing/logging.
     results_accounted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Local lifecycle state (see :class:`BatchLocalStatus`). Rows written before
+    # this column existed are seeded IN_PROGRESS, so the background worker picks
+    # them up and the manual results path stays the fallback when it is disabled.
+    local_status: Mapped[str] = mapped_column(
+        String(16), default=BatchLocalStatus.IN_PROGRESS, server_default=BatchLocalStatus.IN_PROGRESS, index=True
+    )
+    # Polling lease: which gateway process holds the batch, the token for that
+    # one claim (changes on every claim, so a superseded owner cannot settle a
+    # lease it lost), and when the lease lapses for another replica to take it.
+    lease_owner: Mapped[str | None] = mapped_column(String(36))
+    lease_token: Mapped[str | None] = mapped_column(String(36))
+    leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # Bounded-backoff schedule: earliest time the batch is due another poll,
+    # and how many polls have run (drives the exponential delay).
+    next_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Last transient obstruction (provider 429/5xx, missing pricing, DB error),
+    # for operators; NULL on a healthy batch.
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 IDEMPOTENCY_TABLE = "idempotency_keys"

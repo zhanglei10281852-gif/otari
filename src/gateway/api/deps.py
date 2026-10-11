@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -19,6 +20,7 @@ from gateway.core.unit_of_work import UnitOfWork
 from gateway.log_config import logger
 from gateway.metrics import REGISTRY, Counter
 from gateway.models.api_keys import APIKey
+from gateway.models.pricing import ModelPricing
 from gateway.models.tenancy import User as TenancyUser
 from gateway.ports.agent_model_recommender_port import AgentModelRecommenderPort
 from gateway.ports.api_key_format_port import ApiKeyFormatPort, Malformed, Misdirected
@@ -53,17 +55,18 @@ from gateway.repositories.tools import (
 )
 from gateway.repositories.users_repository import get_active_user
 from gateway.services.api_keys import ApiKeyService
-from gateway.services.budgets import BudgetMembershipListener, BudgetService
+from gateway.services.budgets import BudgetMembershipListener, BudgetService, record_external_spend
 from gateway.services.code_execution import SandboxContainerRegistry
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, resolve_dashboard_session
 from gateway.services.feedback import FeedbackService
 from gateway.services.files import FileBackends, FileService, SandboxFileBridge, StagedFile
-from gateway.services.inference import IdempotencyService
+from gateway.services.inference import BatchSettlementService, IdempotencyService
 from gateway.services.log_writer import LogWriter
 from gateway.services.master_key_service import hash_master_key, is_generated_master_key, load_master_key_hash
 from gateway.services.organization_pricing_service import OrganizationPricingService
 from gateway.services.overview import OverviewService
 from gateway.services.playground_service import ForwardedToolOffer, LocalToolOffer, PlaygroundToolOffer
+from gateway.services.pricing_service import find_model_pricing
 from gateway.services.providers import OrgProviderModelService, ProviderEndpointService, refresh_provider_endpoint_cache
 from gateway.services.rate_limits import RateLimitService
 from gateway.services.routing import clear_router_backend_cache
@@ -85,7 +88,11 @@ from gateway.services.tools import (
     WorkspaceCodeExecutionPolicyService,
     WorkspaceSearchKeys,
 )
-from gateway.services.workspace_scope import default_workspace_id
+from gateway.services.workspace_scope import (
+    default_workspace_id,
+    organization_for_workspace_id,
+    workspace_for_key_id,
+)
 
 # Legacy module-level fallback. Config now lives on ``app.state.config`` (set in
 # ``create_app``); ``get_config`` reads from the request's app state and only
@@ -714,6 +721,64 @@ def _file_backends(request: Request) -> FileBackends | None:
 def build_idempotency_service(uow: UnitOfWork, config: GatewayConfig) -> IdempotencyService:
     """Build idempotency-key handling for a completion request or the expiry sweep."""
     return IdempotencyService(uow, InferenceRepositories.on(uow), config)
+
+
+class _BatchSettlementPortsAdapter:
+    """Bind the settlement worker's ports onto its tick's session.
+
+    The old-shape pricing and budgets functions still take the session
+    directly; this adapter is the one place that names it for them, while the
+    service itself keeps going through its repositories.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self._db = db
+
+    async def find_pricing(
+        self,
+        provider: str,
+        model: str,
+        organization_id: uuid.UUID | None,
+    ) -> ModelPricing | None:
+        return await find_model_pricing(self._db, provider, model, organization_id=organization_id)
+
+    async def fold_spend(self, user_id: str, cost: Decimal) -> None:
+        await record_external_spend(self._db, user_id, cost)
+
+    async def workspace_for_key(self, api_key_id: str | None) -> uuid.UUID:
+        return await workspace_for_key_id(self._db, api_key_id)
+
+    async def organization_for_workspace(
+        self,
+        workspace_id: uuid.UUID | None,
+    ) -> uuid.UUID | None:
+        return await organization_for_workspace_id(self._db, workspace_id)
+
+    async def origin_key_exempt(self, api_key_id: str | None) -> bool:
+        # A deleted originating key defaults to enforced, the conservative choice.
+        if api_key_id is None:
+            return False
+        origin_key = await self._db.get(APIKey, api_key_id)
+        return origin_key is not None and origin_key.exclude_from_budget
+
+
+def build_batch_settlement_service(
+    uow: UnitOfWork,
+    db: AsyncSession,
+    config: GatewayConfig,
+    log_writer: LogWriter,
+    *,
+    owner: str,
+) -> BatchSettlementService:
+    """Build the background batch settlement service for one worker tick."""
+    return BatchSettlementService(
+        uow,
+        InferenceRepositories.on(uow),
+        _BatchSettlementPortsAdapter(db),
+        config,
+        log_writer,
+        owner=owner,
+    )
 
 
 def build_sandbox_file_bridge(

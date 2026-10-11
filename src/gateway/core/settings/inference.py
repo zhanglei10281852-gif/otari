@@ -34,3 +34,42 @@ class InferenceSettings(BaseModel):
         ge=1,
         description="How often expired idempotency records are deleted.",
     )
+
+    batch_settlement_enabled: Annotated[bool, OMITTED] = Field(
+        default=True,
+        description=(
+            "Whether locally-recorded batches are advanced and billed in the background without a client "
+            "reading results. Off keeps settlement on the first GET results retrieval as before. "
+            "Not available in hybrid mode."
+        ),
+    )
+    batch_settlement_interval_sec: Annotated[int, OMITTED] = Field(
+        default=60,
+        ge=1,
+        description="How often the background worker looks for batches due a poll.",
+    )
+    batch_settlement_batch_size: Annotated[int, OMITTED] = Field(
+        default=10,
+        ge=1,
+        description="How many due batches one worker tick advances.",
+    )
+    batch_settlement_lease_sec: Annotated[int, OMITTED] = Field(
+        default=60,
+        ge=10,
+        description=(
+            "How long one gateway's polling lease on a batch stays valid. Past this, another replica may "
+            "claim the batch if the worker holding it stalled."
+        ),
+    )
+    batch_settlement_backoff_base_sec: Annotated[int, OMITTED] = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Base delay before re-polling a still-running or temporarily obstructed batch; it doubles each retry."
+        ),
+    )
+    batch_settlement_backoff_cap_sec: Annotated[int, OMITTED] = Field(
+        default=1800,
+        ge=5,
+        description="Largest delay between polls of a batch, so retries are bounded and never busy-loop.",
+    )
