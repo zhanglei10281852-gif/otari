@@ -24,6 +24,13 @@ What the registry decides:
   workspace would interleave their code and each collect the other's files, so
   a resume while another request is running is refused with
   :class:`ContainerBusyError` rather than admitted.
+* **Fencing.** Each claim carries a token minted for that claim alone, both on
+  the first take and on the takeover of one whose deadline passed. Only the
+  request still holding it may renew, record, release or forget the row, so a
+  request that outlived its claim and lost it to a takeover finishes its own
+  response without touching the new holder's session handle, clocks or
+  occupancy. A live request renews the claim on a bounded timer; a dead process
+  stops renewing and the claim passes at its deadline.
 
 Standalone only: it keeps its rows in the local database. Reclaiming the
 sandbox itself is the provider's job, told the idle timeout at release; the
@@ -37,15 +44,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from gateway.core.unit_of_work import UnitOfWork
+from gateway.core.unit_of_work import UnitOfWork, create_unit_of_work
 from gateway.exceptions.tools_exceptions import ContainerOnManagedCredentialError
 from gateway.repositories.code_execution import (
     SandboxContainerRow,
     claim_container_row,
     delete_container_rows,
+    forget_container_row,
     get_container_row,
+    insert_container_row,
+    record_container_row,
     release_container_claim,
-    upsert_container_row,
+    renew_container_claim,
 )
 
 # The gateway's own container ids. OpenAI issues ``cntr_``-prefixed ids and
@@ -62,11 +72,21 @@ CONTAINER_AUTO = "auto"
 # sandbox it is running code in, so nothing legitimate is displaced and a claim
 # a crashed gateway never released expires with the lease it was protecting.
 CONTAINER_CLAIM_TTL_S = 3600.0
+# How often a still-running request extends its claim. Far shorter than the
+# claim TTL, so a healthy request survives several missed renewals while a dead
+# process's claim passes at one TTL plus at most one interval after its last
+# renewal.
+CONTAINER_CLAIM_RENEW_INTERVAL_S = 300.0
 
 
 def new_container_id() -> str:
     """A fresh container id, minted once per lease and kept across resumes."""
     return f"{CONTAINER_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+def new_claim_token() -> str:
+    """A fresh, non-reusable identity for one claim or one expired-claim takeover."""
+    return uuid.uuid4().hex
 
 
 def requested_container(value: object) -> str | None:
@@ -155,7 +175,9 @@ class ContainerLease:
     ``provider_session_id`` is the provider's own handle, the one the port
     resumes. ``expires_at`` is the idle clock and ``hard_expires_at`` the hard
     one, both as reported to the client; the sandbox may in fact live a little
-    longer, never shorter.
+    longer, never shorter. ``claim_token`` is the fencing identity the resolving
+    request took and every owner-scoped write has to name; ``None`` on a lease
+    for a sandbox no prior request held.
     """
 
     container_id: str
@@ -163,6 +185,7 @@ class ContainerLease:
     provider_session_id: str
     expires_at: datetime
     hard_expires_at: datetime
+    claim_token: str | None = None
 
 
 class SandboxContainers(Protocol):
@@ -180,12 +203,24 @@ class SandboxContainers(Protocol):
         """The lease this request holds, with both clocks set from now."""
         ...
 
-    async def record(self, lease: ContainerLease) -> None:
-        """Persist the lease so the next request can resume it."""
+    async def record(self, lease: ContainerLease) -> bool:
+        """Persist the lease so the next request can resume it.
+
+        Returns whether this caller still owned the claim; ``False`` when a
+        takeover happened first, in which case nothing was written.
+        """
         ...
 
-    async def release(self, container_id: str) -> None:
+    async def renew(self, lease: ContainerLease) -> bool:
+        """Extend the claim a still-running request holds, if it still owns it."""
+        ...
+
+    async def release(self, container_id: str, *, claim_token: str) -> None:
         """Give back a claim taken at admission that no lease will be recorded against."""
+        ...
+
+    async def forget(self, container_id: str, *, claim_token: str) -> None:
+        """Drop the mapping once the provider says the session is gone."""
         ...
 
 
@@ -196,7 +231,8 @@ class SandboxContainerRegistry:
     known. Writes go through the request's Unit of Work, one block each, for
     the reason the file bridge's do: the request session is released before
     the provider is dispatched, so nothing here holds a transaction open while
-    code runs.
+    code runs. The claim heartbeat alone runs on blocks of its own, because it
+    fires from a background task while the request session is parked.
     """
 
     def __init__(
@@ -237,6 +273,9 @@ class SandboxContainerRegistry:
             provider_session_id=provider_session_id,
             expires_at=min(now + timedelta(seconds=self._idle_ttl_s), hard),
             hard_expires_at=hard,
+            # Ownership is the admission claim's for the whole request, however
+            # the lease object gets rebuilt once the session opens.
+            claim_token=resumed.claim_token if resumed is not None else None,
         )
 
     async def resolve(self, container_id: str) -> ContainerLease:
@@ -246,16 +285,20 @@ class SandboxContainerRegistry:
         another tenant's or another provider's, and :class:`ContainerBusyError`
         when it is this caller's own and another of their requests holds it.
 
-        A row whose clocks ran out is dropped on the way, so the next resume
-        does not read it again. Every write lands before either error is raised,
+        A row whose clocks ran out is dropped on the way unless a live claim
+        still runs code in it (a long request past its idle clock), so the next
+        resume does not read a dead row but an in-use one is not swept out from
+        under its request. Every write lands before either error is raised,
         which is why the block closes first.
         """
         if not container_id.startswith(CONTAINER_ID_PREFIX):
             raise ContainerNotFoundError(container_id)
         now = datetime.now(UTC)
+        claim_token = new_claim_token()
         async with self._uow:
             row = await get_container_row(self._uow, container_id)
-            expired = row is not None and (row.expires_at <= now or row.hard_expires_at <= now)
+            claim_live = row is not None and row.in_use_until is not None and row.in_use_until > now
+            expired = row is not None and (row.expires_at <= now or row.hard_expires_at <= now) and not claim_live
             if expired:
                 await delete_container_rows(self._uow, [container_id])
             resumable = (
@@ -265,22 +308,51 @@ class SandboxContainerRegistry:
                 and row.workspace_id == self._workspace_id
                 and row.provider == self._provider
             )
-            claimed = resumable and await claim_container_row(
-                self._uow,
-                container_id,
-                now=now,
-                until=now + timedelta(seconds=CONTAINER_CLAIM_TTL_S),
-            )
+            # Never claim past the hard clock: at that deadline the row belongs
+            # to the sweep, and a claim reaching past it would delay reclaim.
+            claimed = False
+            if resumable:
+                assert row is not None  # ``resumable`` already says so
+                until = min(now + timedelta(seconds=CONTAINER_CLAIM_TTL_S), row.hard_expires_at)
+                claimed = await claim_container_row(
+                    self._uow,
+                    container_id,
+                    now=now,
+                    until=until,
+                    claim_token=claim_token,
+                )
         if row is None or not resumable:
             raise ContainerNotFoundError(container_id)
         if not claimed:
             raise ContainerBusyError(container_id)
-        return _lease_from_row(row)
+        return _lease_from_row(row, claim_token=claim_token)
 
-    async def record(self, lease: ContainerLease) -> None:
+    async def record(self, lease: ContainerLease) -> bool:
+        """Record the lease a held session ended with, or no-op having lost the claim.
+
+        A fresh sandbox (no claim, no row) inserts it. A resumed one is updated
+        only where this request still holds the claim token; a takeover turns
+        that into a no-op rather than a write over the new holder's row.
+        """
         now = datetime.now(UTC)
         async with self._uow:
-            await upsert_container_row(
+            if lease.claim_token is None:
+                await insert_container_row(
+                    self._uow,
+                    SandboxContainerRow(
+                        id=lease.container_id,
+                        user_id=self._user_id,
+                        workspace_id=self._workspace_id,
+                        provider=lease.provider,
+                        provider_session_id=lease.provider_session_id,
+                        created_at=now,
+                        last_used_at=now,
+                        expires_at=lease.expires_at,
+                        hard_expires_at=lease.hard_expires_at,
+                    ),
+                )
+                return True
+            return await record_container_row(
                 self._uow,
                 SandboxContainerRow(
                     id=lease.container_id,
@@ -293,23 +365,44 @@ class SandboxContainerRegistry:
                     expires_at=lease.expires_at,
                     hard_expires_at=lease.hard_expires_at,
                 ),
+                claim_token=lease.claim_token,
             )
 
-    async def forget(self, container_id: str) -> None:
-        async with self._uow:
-            await delete_container_rows(self._uow, [container_id])
+    async def renew(self, lease: ContainerLease) -> bool:
+        """Extend a live request's claim to the next deadline, bounded by the hard clock.
 
-    async def release(self, container_id: str) -> None:
+        Runs from the backend's heartbeat on a block of its own, so it never
+        shares the parked request session. ``False`` means the claim is no
+        longer this caller's (a deadline and a takeover passed) or the hard
+        clock ran out; the caller then writes nothing more.
+        """
+        token = lease.claim_token
+        if token is None:
+            return False
+        now = datetime.now(UTC)
+        if lease.hard_expires_at <= now:
+            return False
+        until = min(now + timedelta(seconds=CONTAINER_CLAIM_TTL_S), lease.hard_expires_at)
+        async with create_unit_of_work() as uow:
+            async with uow:
+                return await renew_container_claim(uow, lease.container_id, claim_token=token, until=until)
+
+    async def forget(self, container_id: str, *, claim_token: str) -> None:
+        async with self._uow:
+            await forget_container_row(self._uow, container_id, claim_token=claim_token)
+
+    async def release(self, container_id: str, *, claim_token: str) -> None:
         """Give back a claim this request took and will not record a lease against."""
         async with self._uow:
-            await release_container_claim(self._uow, container_id)
+            await release_container_claim(self._uow, container_id, claim_token=claim_token)
 
 
-def _lease_from_row(row: SandboxContainerRow) -> ContainerLease:
+def _lease_from_row(row: SandboxContainerRow, *, claim_token: str) -> ContainerLease:
     return ContainerLease(
         container_id=row.id,
         provider=row.provider,
         provider_session_id=row.provider_session_id,
         expires_at=row.expires_at,
         hard_expires_at=row.hard_expires_at,
+        claim_token=claim_token,
     )

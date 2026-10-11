@@ -379,7 +379,7 @@ async def test_a_sandbox_collaborator_joins_the_step_the_request_has_open(notes_
         commits = _count_commits(session)
         async with uow:
             await _write(session_for(uow), "request step")
-            await registry.release("otari_cntr_unknown")
+            await registry.release("otari_cntr_unknown", claim_token="t1")
             assert commits() == 0
             assert await _committed_bodies() == []
 

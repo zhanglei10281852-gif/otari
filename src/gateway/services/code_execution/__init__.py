@@ -7,6 +7,7 @@ this package, so the two cannot share one.
 
 from gateway.services.code_execution.containers import (
     CONTAINER_AUTO,
+    CONTAINER_CLAIM_RENEW_INTERVAL_S,
     CONTAINER_CLAIM_TTL_S,
     CONTAINER_ID_PREFIX,
     ContainerBusyError,
@@ -16,12 +17,14 @@ from gateway.services.code_execution.containers import (
     SandboxContainers,
     check_container_on_credential,
     gateway_container_value,
+    new_claim_token,
     new_container_id,
     requested_container,
 )
 
 __all__ = [
     "CONTAINER_AUTO",
+    "CONTAINER_CLAIM_RENEW_INTERVAL_S",
     "CONTAINER_CLAIM_TTL_S",
     "CONTAINER_ID_PREFIX",
     "ContainerBusyError",
@@ -31,6 +34,7 @@ __all__ = [
     "SandboxContainers",
     "check_container_on_credential",
     "gateway_container_value",
+    "new_claim_token",
     "new_container_id",
     "requested_container",
 ]

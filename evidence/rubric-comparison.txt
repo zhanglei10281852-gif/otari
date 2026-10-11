@@ -1,0 +1,10 @@
+项目：mozilla-ai-otari-809b7280-edcf-417f-93f4-5a98a8ac7600｜沙箱租约接管后的过期请求隔离
+Session：6ac9e644cf1c7ce7943c30ea｜有效轮数：103｜完成度：完成｜收录：长程题
+验证摘要：架构检查通过；108 个专项单元测试、17 个 sandbox 复用集成测试、12 个迁移检查通过。
+Rubric ID：1｜状态：通过｜期望行为：首次领取和过期接管生成新令牌，旧令牌不能写新持有者。｜实际观察：claim_container_row 每次成功领取写入调用方新 token；renew、record、release、forget 均以 container id 与 claim_token 条件更新。｜直接证据：领取、接管、旧 token 四类写入被拒绝的单元与 Postgres 集成用例通过；sandbox_container_repository.py:165-252。
+Rubric ID：2｜状态：通过｜期望行为：健康长请求有界续期并阻止第二请求接管。｜实际观察：SandboxBackend 启动心跳，在 hard_expires_at 上界内定期调用独立 UoW renew；存活 in_use_until 使第二 claim 更新零行并返回忙碌 409。｜直接证据：心跳续期、硬时钟上界和第二请求忙碌用例通过。
+Rubric ID：3｜状态：通过｜期望行为：停止续期后可接管，旧请求迟到不能改写新状态。｜实际观察：心跳停止后 in_use_until 到期允许新 token 接管；旧 token 的 record、release、forget 条件更新均返回零行，新 token、provider session 和时钟保持不变。｜直接证据：takeover 后 stale record 与 forget 的 Postgres 集成用例通过；sandbox_container_repository.py:96-252。
+Rubric ID：4｜状态：通过｜期望行为：正常、初始化失败、取消、断连和输出失败按既有语义收尾且受 token 约束。｜实际观察：正常与输出收集完成走 fenced record，初始化失败走 fenced release，取消和流式断连先停止心跳再走对应 fenced 收尾；claim_lost 时跳过旧 owner 写入。｜直接证据：sandbox backend 生命周期、心跳停止、初始化失败、取消与输出失败单元用例通过。
+Rubric ID：5｜状态：通过｜期望行为：session gone 仅当前持有者可遗忘映射。｜实际观察：pipeline 从 admission lease 取 claim_token 调用 forget；仓储 DELETE 同时匹配 id 与 token，旧 token 删除零行。｜直接证据：current owner forget 与 stale owner forget 单元用例通过；src/gateway/api/routes/_pipeline.py:2666-2683。
+Rubric ID：6｜状态：通过｜期望行为：升级和重启兼容旧行并保持各隔离维度与时钟。｜实际观察：迁移只新增 nullable claim_token，旧行的 user、workspace、provider、session、idle 与 hard 字段不变；renew 只改 in_use_until，record 保留 hard_expires_at。｜直接证据：迁移单头、完整链与 schema parity 12 项通过；迁移 e1f2a3b4c5d6。
+Rubric ID：7｜状态：通过｜期望行为：不复用、auto、400、409 及协议表面保持现有行为。｜实际观察：未请求复用不持有映射，首次 auto 创建新容器，未知或过期返回 400，存活 claim 返回 409；Messages、Responses 和工具结果仍只暴露既有 container id 与 expires_at。｜直接证据：17 个 sandbox 复用集成用例全部通过。

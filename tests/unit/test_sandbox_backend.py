@@ -8,6 +8,7 @@ contract.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import traceback
 from collections.abc import AsyncIterator
@@ -1663,10 +1664,13 @@ async def test_resuming_a_session_the_backend_reclaimed_is_gone(monkeypatch: pyt
 class _FakeContainers:
     """A registry double: fixed clocks, and it remembers what was recorded."""
 
-    def __init__(self, idle_s: float = 600.0) -> None:
+    def __init__(self, idle_s: float = 600.0, *, renew_to: bool = True) -> None:
         self.idle_s = idle_s
         self.recorded: list[ContainerLease] = []
-        self.released: list[str] = []
+        self.released: list[tuple[str, str | None]] = []
+        self.renewed: list[ContainerLease] = []
+        # What the fence answers: False stands in for a claim a takeover took.
+        self.renew_to = renew_to
 
     def keep_alive_s(self, resumed: ContainerLease | None) -> float:
         return self.idle_s
@@ -1679,13 +1683,19 @@ class _FakeContainers:
             provider_session_id=provider_session_id,
             expires_at=now + timedelta(seconds=self.idle_s),
             hard_expires_at=resumed.hard_expires_at if resumed else now + timedelta(hours=1),
+            claim_token=resumed.claim_token if resumed is not None else None,
         )
 
-    async def record(self, lease: ContainerLease) -> None:
+    async def record(self, lease: ContainerLease) -> bool:
         self.recorded.append(lease)
+        return True
 
-    async def release(self, container_id: str) -> None:
-        self.released.append(container_id)
+    async def renew(self, lease: ContainerLease) -> bool:
+        self.renewed.append(lease)
+        return self.renew_to
+
+    async def release(self, container_id: str, *, claim_token: str | None = None) -> None:
+        self.released.append((container_id, claim_token))
 
 
 class _HoldingPort(_RecordingPort):
@@ -1762,3 +1772,84 @@ async def test_without_a_registry_nothing_is_held_or_reported() -> None:
     async with SandboxBackend(port=port) as backend:
         assert port.keep_alive_s is None
         assert backend.lease is None
+
+
+class _DecliningPort(_RecordingPort):
+    """Holds nothing across requests, so the backend releases on exit."""
+
+    @asynccontextmanager
+    async def open_session(self, **kwargs: Any) -> AsyncIterator[Any]:
+        del kwargs
+        yield SimpleNamespace(session_id="s-old", holds_across_requests=False, discard=lambda: None)
+
+
+def _resumed(token: str | None = "claim-1") -> ContainerLease:
+    now = datetime.now(UTC)
+    return ContainerLease(
+        container_id="otari_cntr_deadbeef",
+        provider="recording",
+        provider_session_id="s-old",
+        expires_at=now + timedelta(minutes=5),
+        hard_expires_at=now + timedelta(minutes=30),
+        claim_token=token,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_long_resumed_request_renews_its_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healthy tool loop keeps the claim it took, so it is not taken over."""
+    import gateway.services.sandbox_backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONTAINER_CLAIM_RENEW_INTERVAL_S", 0.005)
+    containers = _FakeContainers()
+
+    async with SandboxBackend(port=_HoldingPort(), container=_resumed(), containers=containers):
+        await asyncio.sleep(0.05)
+
+    assert containers.renewed, "the heartbeat renewed the claim while code ran"
+    assert all(lease.claim_token == "claim-1" for lease in containers.renewed)
+    # And it still records normally on the way out.
+    assert [lease.container_id for lease in containers.recorded] == ["otari_cntr_deadbeef"]
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_lost_its_claim_leaves_the_new_holder_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The takeover race: finish the response, but record and release nothing."""
+    import gateway.services.sandbox_backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONTAINER_CLAIM_RENEW_INTERVAL_S", 0.005)
+    containers = _FakeContainers(renew_to=False)
+
+    async with SandboxBackend(port=_HoldingPort(), container=_resumed(), containers=containers):
+        await asyncio.sleep(0.05)
+
+    assert containers.recorded == []
+    assert containers.released == []
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_session_that_is_not_held_is_released_through_its_token() -> None:
+    """The release path names the claim identity, not just the container id."""
+    containers = _FakeContainers()
+
+    async with SandboxBackend(port=_DecliningPort(), container=_resumed("claim-9"), containers=containers):
+        pass
+
+    assert containers.recorded == []
+    assert containers.released == [("otari_cntr_deadbeef", "claim-9")]
+
+
+@pytest.mark.asyncio
+async def test_the_heartbeat_never_starts_for_a_fresh_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh sandbox has no row or claim until it is recorded at exit."""
+    import gateway.services.sandbox_backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONTAINER_CLAIM_RENEW_INTERVAL_S", 0.005)
+    containers = _FakeContainers()
+
+    async with SandboxBackend(port=_HoldingPort(), containers=containers):
+        await asyncio.sleep(0.05)
+
+    assert containers.renewed == []

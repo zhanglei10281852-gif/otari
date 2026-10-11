@@ -532,6 +532,14 @@ class SandboxContainer(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     hard_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # The claim one in-flight request holds, so a second cannot run code in the
-    # same workspace at the same time. Cleared when the request records its
-    # lease; the timestamp releases one a crashed gateway never gave back.
+    # same workspace at the same time. Cleared when the request releases without
+    # holding; the timestamp releases one a crashed gateway never gave back.
     in_use_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    # The fencing identity of the request that holds the claim, minted on every
+    # first claim and every takeover of an expired one. An owner-scoped write
+    # (renew, record, release, forget) matches this token, so a request whose
+    # claim expired under it cannot touch the row the new holder now owns. Kept
+    # after a recorded lease (the row is free but still names its last owner) so
+    # the same request can still drop a session the provider says is gone; the
+    # next claim replaces it. NULL on rows nothing ever claimed.
+    claim_token: Mapped[str | None] = mapped_column(String, nullable=True, default=None)

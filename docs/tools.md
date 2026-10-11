@@ -200,6 +200,15 @@ A sandbox runs one request at a time. Naming a container another of your own
 requests is still using is a 409, not a 400: the id is good and a retry works,
 where a 400 would have a client throw a live sandbox away. Two requests sharing
 one workspace would interleave their code and each collect the other's files.
+The request that holds a sandbox carries a claim identity minted for that claim
+alone, and renews it on a bounded timer while its tool loop keeps running, so a
+healthy long request is not taken over for outliving the claim deadline. Only
+that identity may record the lease, release the claim, renew it, or drop the
+mapping when the provider says the session is gone. A request whose claim did
+expire and another took over still finishes its own response, but its writes
+then match no row and change nothing the new holder owns; a process that
+crashes simply stops renewing, so another instance can recover the sandbox once
+the deadline passes.
 
 A response carries a container only when the sandbox really will still be there.
 A `protocol` backend that declines the idle timeout Otari asks for is told to

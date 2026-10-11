@@ -26,6 +26,7 @@ refactor to :func:`gateway.services.mcp_loop.mcp_tool_loop`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, aclosing
@@ -42,7 +43,13 @@ from gateway.ports.code_execution_port import (
     SandboxSessionGoneError,
     SandboxUnavailableError,
 )
-from gateway.services.code_execution import CONTAINER_ID_PREFIX, ContainerLease, SandboxContainers, new_container_id
+from gateway.services.code_execution import (
+    CONTAINER_CLAIM_RENEW_INTERVAL_S,
+    CONTAINER_ID_PREFIX,
+    ContainerLease,
+    SandboxContainers,
+    new_container_id,
+)
 from gateway.services.tool_usage import ToolUsageTally
 from gateway.types.code_execution import ResultBlock
 
@@ -299,6 +306,12 @@ class SandboxBackend:
         self._allowed_tools = allowed_tools
         self._session: CodeExecutionSession | None = None
         self._stack: AsyncExitStack = AsyncExitStack()
+        # The heartbeat that keeps a resumed request's claim ahead of its
+        # deadline while the tool loop runs, and what it concluded if it
+        # stopped on its own: a claim the registry says is no longer ours makes
+        # every exit write a no-op.
+        self._claim_renewals: asyncio.Task[None] | None = None
+        self._claim_lost = False
         # The calls executed since the last ``take_executions``, in order. A loop
         # that mints native result blocks drains this right after the awaited
         # calls it made, which is what keeps a batch's blocks paired with the
@@ -325,6 +338,12 @@ class SandboxBackend:
             )
         )
         self._session = session
+        # A resumed sandbox is claimed for the whole request; keep that claim
+        # ahead of its deadline while code runs, including where the adapter
+        # declines to hold it past the request, since two requests must not
+        # share the live workspace either way.
+        if self._containers is not None and self._resume is not None and self._resume.claim_token is not None:
+            self._claim_renewals = asyncio.create_task(self._renew_claim_loop())
         # Only where the adapter says the session really will outlive this block:
         # a backend that declined to hold it releases on exit, and a container id
         # promising a sandbox that is already gone is worse than none.
@@ -461,33 +480,94 @@ class SandboxBackend:
             return None
         return file_id, counted.total
 
+    async def _renew_claim_loop(self) -> None:
+        """Keep this request's claim from expiring until the backend closes.
+
+        A bounded renewal, capped at the hard clock by the registry: a healthy
+        request is not taken over for outliving the claim deadline in a long
+        tool loop, while a process that crashed stops renewing and another
+        replica takes over once the last deadline passes. A renewal that says
+        the claim has a newer owner ends the loop; the request still finishes,
+        but its exit writes nothing.
+        """
+        assert self._containers is not None and self._resume is not None
+        try:
+            while True:
+                await asyncio.sleep(CONTAINER_CLAIM_RENEW_INTERVAL_S)
+                lease = self.lease if self.lease is not None else self._resume
+                try:
+                    held = await self._containers.renew(lease)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - a blip retries next interval; repeated loss is detected there
+                    logger.warning("container claim renewal for %s failed; retrying", lease.container_id, exc_info=True)
+                    continue
+                if not held:
+                    logger.info(
+                        "container claim %s has a newer owner; this request will leave its state untouched",
+                        lease.container_id,
+                    )
+                    self._claim_lost = True
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _stop_claim_renewals(self) -> None:
+        """Cancel the heartbeat and let it finish before the exit writes run."""
+        task = self._claim_renewals
+        self._claim_renewals = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     async def __aexit__(
         self,
         _exc_type: type[BaseException] | None,
         _exc: BaseException | None,
         _tb: TracebackType | None,
     ) -> None:
+        # Stop renewing before the claim-changing exit writes, so a heartbeat
+        # cannot race the record or release below.
+        await self._stop_claim_renewals()
         # Releasing, or holding, the session is the port's; this unwinds the
         # block it was entered in, which is what triggers either.
         self._session = None
         await self._stack.aclose()
         if self._containers is None:
             return
+        if self._claim_lost:
+            # A takeover happened while this request ran. Its own response still
+            # stands, but recording, releasing or forgetting here would write the
+            # new holder's row; the fence already turned every one into a no-op.
+            return
         if self.lease is not None:
             # Written after the hold, so a row never promises a sandbox the
             # provider was not yet asked to keep. Recording is also what gives
-            # back the claim this request took at admission. A write that fails
-            # leaves the sandbox held but the id unresumable, which the
-            # provider's timer then cleans up; the run itself stands.
+            # back the claim this request took at admission, and only where it
+            # still owns it: a takeover makes the write a no-op rather than a
+            # clear of the new holder's occupancy. A write that fails leaves the
+            # sandbox held but the id unresumable, which the provider's timer
+            # then cleans up; the run itself stands.
             try:
-                await self._containers.record(self.lease)
+                recorded = await self._containers.record(self.lease)
+                if not recorded:
+                    logger.info(
+                        "container lease %s not recorded: its claim has a newer owner", self.lease.container_id
+                    )
             except Exception:  # noqa: BLE001 - bookkeeping must not fail a completed run
                 logger.warning("could not record container lease %s", self.lease.container_id, exc_info=True)
-        elif self._resume is not None:
+        elif self._resume is not None and self._resume.claim_token is not None:
             # Resumed and then not held: nothing will record a lease, so the
             # claim has to be handed back here rather than waiting out its TTL.
+            # Fenced like record: a claim taken over is not this request's to free.
             try:
-                await self._containers.release(self._resume.container_id)
+                await self._containers.release(
+                    self._resume.container_id, claim_token=self._resume.claim_token
+                )
             except Exception:  # noqa: BLE001 - the claim expires on its own either way
                 logger.warning("could not release container claim %s", self._resume.container_id, exc_info=True)
 

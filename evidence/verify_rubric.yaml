@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 每次 sandbox container claim 的首次领取或过期接管都会产生新所有者令牌，旧令牌不能释放、覆写或删除新持有者的映射。
+  - id: 2
+    type: f2p
+    text: 长请求在 claim 接近过期时有界续期，健康执行不会被第二请求接管，第二请求仍收到可重试的 409。
+  - id: 3
+    type: f2p
+    text: 进程停止续期或崩溃后，其他副本能在期限后接管；旧请求迟到完成时不能清除新 claim 或改写 provider session 与时钟。
+  - id: 4
+    type: f2p
+    text: 正常完成、初始化失败、取消、流式断连和输出收集失败分别保留或释放既有 lease 语义，且所有收尾写入都受当前 claim 令牌约束。
+  - id: 5
+    type: f2p
+    text: provider 报告 resumed session gone 时只有当前持有者能遗忘映射，失去 claim 的旧请求不能删除后来接管并更新的 container。
+  - id: 6
+    type: f2p
+    text: schema 升级与网关重启兼容已有 container 行，并继续隔离 user、workspace、provider、idle clock 和不可重启的 hard clock。
+  - id: 7
+    type: p2p
+    text: 不复用 sandbox、首次 auto、未知或过期的 400、忙碌的 409，以及 Messages、Responses 和工具结果中的 container 表面保持现有行为。

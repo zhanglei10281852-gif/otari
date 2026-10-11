@@ -13,6 +13,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator, Generator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from unittest.mock import patch
@@ -28,7 +29,9 @@ from gateway.ports.code_execution_port import SandboxFileEntry, SandboxSessionGo
 from gateway.repositories.code_execution import (
     SandboxContainerRow,
     claim_container_row,
+    forget_container_row,
     get_container_row,
+    record_container_row,
     upsert_container_row,
 )
 from gateway.services.code_execution import CONTAINER_ID_PREFIX
@@ -241,7 +244,9 @@ async def test_a_second_request_cannot_run_in_a_sandbox_a_first_is_still_using(
     now = datetime.now(UTC)
     uow = UnitOfWork(async_db)
     async with uow:
-        assert await claim_container_row(uow, container_id, now=now, until=now + timedelta(minutes=5))
+        assert await claim_container_row(
+            uow, container_id, now=now, until=now + timedelta(minutes=5), claim_token="held-by-first"
+        )
 
     response = _post(client, api_key_header, _body(container_id), port)
 
@@ -249,6 +254,57 @@ async def test_a_second_request_cannot_run_in_a_sandbox_a_first_is_still_using(
     error = response.json()["detail"]["error"]
     assert "in use by another request" in error["message"]
     assert len(port.opened) == 1, "a refused request leases nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_outlived_its_claim_cannot_write_the_new_holders_row(
+    async_db: AsyncSession, client: TestClient, api_key_header: dict[str, str], sandbox_env: None
+) -> None:
+    """The takeover race, at the row level: the stale owner's writes are fenced out.
+
+    The second request ran past its deadline and a third request now holds the
+    sandbox. When the second finishes, its record, forget and release must match
+    no row, leaving the holder's session id, clocks and busy occupancy intact
+    instead of freeing the container for concurrent entry.
+    """
+    port = _FakePort()
+    first = _post(client, api_key_header, _body(), port)
+    assert first.status_code == 200, first.text
+    container_id = first.json()["container"]["id"]
+    # The resume completes, so the row is free but still names its claim token.
+    assert _post(client, api_key_header, _body(container_id), port).status_code == 200
+
+    uow = UnitOfWork(async_db)
+    async with uow:
+        row = await get_container_row(uow, container_id)
+    assert row is not None and row.in_use_until is None and row.claim_token is not None
+    old_token = row.claim_token
+
+    # The next request takes the free row, the same conditional update an
+    # expired-claim takeover runs.
+    now = datetime.now(UTC)
+    async with uow:
+        assert await claim_container_row(
+            uow, container_id, now=now, until=now + timedelta(minutes=5), claim_token="third-request"
+        )
+
+    # What the late second request would write on its way out.
+    stale = replace(
+        row,
+        provider_session_id="sbx-stale",
+        last_used_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+    async with uow:
+        assert await record_container_row(uow, stale, claim_token=old_token) is False
+        assert await forget_container_row(uow, container_id, claim_token=old_token) is False
+
+    async with uow:
+        final = await get_container_row(uow, container_id)
+    assert final is not None
+    assert final.claim_token == "third-request"
+    assert final.in_use_until is not None, "the stale owner did not free the new holder's claim"
+    assert final.provider_session_id != "sbx-stale", "the stale owner did not overwrite the session handle"
 
 
 def test_a_request_that_asks_for_nothing_holds_nothing(

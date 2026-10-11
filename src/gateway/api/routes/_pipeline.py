@@ -2664,11 +2664,21 @@ class ToolContext:
         self.container_lease = lease
 
     async def forget_container(self) -> None:
-        """Drop the lease this request tried to resume, once the provider said it is gone."""
+        """Drop the lease this request tried to resume, once the provider said it is gone.
+
+        Fenced by the claim identity admission took: if another request took the
+        container over after this one's deadline, this deletes the new holder's
+        mapping no longer, and the next resume is answered by the clocks instead.
+        """
         if self.sandbox_containers is None or self.sandbox_container_lease is None:
             return
+        claim_token = self.sandbox_container_lease.claim_token
+        if claim_token is None:
+            return
         try:
-            await self.sandbox_containers.forget(self.sandbox_container_lease.container_id)
+            await self.sandbox_containers.forget(
+                self.sandbox_container_lease.container_id, claim_token=claim_token
+            )
         except Exception:  # noqa: BLE001 - the next resume refuses it anyway
             logger.warning("could not drop gone container %s", self.sandbox_container_lease.container_id, exc_info=True)
 
